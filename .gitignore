@@ -1,0 +1,24 @@
+# APK / 签名产物
+*.apk
+*.apks
+*.aab
+*.jks
+*.keystore
+
+# 构建产物
+build/
+out/
+dist/
+
+# 逆向中间产物
+_tmp/
+apktool.yml
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 系统
+Thumbs.db
+.DS_Store
