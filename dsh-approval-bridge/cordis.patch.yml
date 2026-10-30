@@ -1,0 +1,6 @@
+# dsh-approval-bridge bundle patch: insert the approval answerer plugin
+# into the composed tree. An empty patch list ([]) mounts NOTHING — that was
+# the bug: the bundle declared a patch but inserted zero entries.
+- insert:
+    - id: dsh-approval-bridge
+      name: dsh-approval-bridge

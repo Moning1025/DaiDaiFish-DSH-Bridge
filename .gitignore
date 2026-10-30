@@ -22,3 +22,8 @@ apktool.yml
 # 系统
 Thumbs.db
 .DS_Store
+
+# 密钥（绝对不入库）
+.env
+*.env
+.env.*
