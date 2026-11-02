@@ -27,3 +27,12 @@ Thumbs.db
 .env
 *.env
 .env.*
+# 但模板要入库
+!.env.example
+
+# runtime logs
+*.log
+
+# Android 本地工具链（~197MB，只在 build.ps1 里用，不入库）
+android-bridge/tools/
+android-bridge/build/

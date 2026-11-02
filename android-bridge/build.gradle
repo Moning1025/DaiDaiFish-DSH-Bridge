@@ -1,0 +1,44 @@
+// 极简构建脚本：目标是产出 classes2.dex 注入原版 APK，不是完整 App。
+// 推荐路线：kotlinc + d8（见 android-bridge/README.md 的三条命令）。
+// 此 Gradle 配置仅用于在装有 Android SDK 的机器上做“能编译”的交叉验证。
+
+plugins {
+    id 'com.android.library'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.shenshen.bridge'
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 24
+        targetSdk 34
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    // 只要 classes，不要资源和 BuildConfig
+    buildFeatures {
+        buildConfig false
+    }
+}
+
+dependencies {
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+}
+
+// 产出 classes.dex（便于手工改名 classes2.dex）
+tasks.register('dexOnly') {
+    dependsOn 'assembleRelease'
+    doLast {
+        println "AAR 产物: build/outputs/aar/；如需 dex，用 d8 对 build/intermediates/javac/release/classes 目录处理"
+    }
+}
