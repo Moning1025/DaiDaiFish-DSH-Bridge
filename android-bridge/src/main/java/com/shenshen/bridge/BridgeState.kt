@@ -3,8 +3,13 @@ package com.shenshen.bridge
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * 全局连接状态 / 待审批 / 任务状态 / 执行轨迹（进程内单例）。
+ * 全局连接状态 / 待审批 / 任务列表 / 执行轨迹（进程内单例）。
  * 写入方：BridgeClient。读取方：UI（DshDashboardActivity）、通知、前台服务。
+ *
+ * v4（P3）新增：
+ *  - tasks / activeTaskId / taskState：多任务标签条 + 四态状态栏
+ *  - TraceEntry 支持 thinking / tool_call / tool_result / final 四类
+ *  - uploadProgress / pendingAttachment：文件分片上传进度与待发送附件
  */
 object BridgeState {
 
@@ -16,14 +21,18 @@ object BridgeState {
         val reason: String,
         val receivedAt: Long,
         val timeoutMs: Long = Config.APPROVAL_TIMEOUT_MS,
+        val taskId: String? = null,
+        val workspace: String? = null,
+        val sessionBrief: String? = null,
     )
 
-    /** 执行轨迹一条：kind = thinking / tool_call */
+    /** 执行轨迹一条：kind = thinking / tool_call / tool_result / final */
     data class TraceEntry(
         val kind: String,
         val brief: String,
         val detail: String,
         val at: Long,
+        val ok: Boolean = true,
     )
 
     /** 电脑端 DSH 的一个工作区（来自 workspace.json 注册表） */
@@ -32,6 +41,20 @@ object BridgeState {
         val title: String,
         val path: String,
         val exists: Boolean = true,
+    )
+
+    /** 电脑端正在跑/跑过的任务（服务端 tasksSnapshot） */
+    data class TaskInfo(
+        val taskId: String,
+        val sessionId: String?,
+        val workspaceTitle: String?,
+        val cwd: String?,
+        val prompt: String,
+        val state: String,
+        val turn: Int,
+        val step: Int,
+        val startedAt: Long,
+        val traceCount: Int,
     )
 
     /** 老接口：只关心连接状态与待审批（BridgeService 用来刷新常驻通知） */
@@ -64,6 +87,37 @@ object BridgeState {
     var taskRunning: Boolean = false
         private set
 
+    /** 当前任务四态：idle / running / success / failed / stopped / stopping */
+    @Volatile
+    var taskState: String = "idle"
+        private set
+
+    @Volatile
+    var taskReason: String? = null
+        private set
+
+    @Volatile
+    var turn: Int = 0
+        private set
+
+    @Volatile
+    var step: Int = 0
+        private set
+
+    /** 电脑端任务列表（新→旧） */
+    @Volatile
+    var tasks: List<TaskInfo> = emptyList()
+        private set
+
+    /** 当前手机界面盯着的任务；空 = 最近一个 */
+    @Volatile
+    var activeTaskId: String? = null
+        private set
+
+    @Volatile
+    var maxTasks: Int = 2
+        private set
+
     /** 电脑端工作区列表（null 表示还没拉过） */
     @Volatile
     var workspaces: List<WorkspaceInfo>? = null
@@ -72,6 +126,25 @@ object BridgeState {
     /** 手机上选中的工作区路径（发任务时随 run 一起发；空 = 用服务端默认根目录） */
     @Volatile
     var selectedWorkspace: String? = null
+        private set
+
+    /** 上传进度：null = 没有进行中的上传 */
+    @Volatile
+    var uploadProgress: Pair<Long, Long>? = null
+        private set
+
+    /** 上传完成、等待随下一条 run 发送的附件路径 */
+    @Volatile
+    var pendingAttachment: String? = null
+        private set
+
+    @Volatile
+    var pendingAttachmentName: String? = null
+        private set
+
+    /** 最近一条流式正文（打字机效果用） */
+    @Volatile
+    var streamText: String = ""
         private set
 
     private val traceEntries = ArrayList<TraceEntry>()
@@ -121,6 +194,37 @@ object BridgeState {
         notifyRefresh()
     }
 
+    /** 服务端 task-state：running / success / failed / stopped / stopping */
+    @Synchronized
+    fun setTaskState(state: String, reason: String? = null, turn: Int? = null, step: Int? = null) {
+        taskState = state
+        taskReason = reason
+        if (turn != null) this.turn = turn
+        if (step != null) this.step = step
+        taskRunning = state == "running" || state == "stopping"
+        notifyRefresh()
+    }
+
+    @Synchronized
+    fun setTasks(list: List<TaskInfo>, active: String? = null) {
+        tasks = list
+        if (active != null) activeTaskId = active
+        if (activeTaskId == null) activeTaskId = list.firstOrNull()?.taskId
+        notifyRefresh()
+    }
+
+    @Synchronized
+    fun setActiveTask(taskId: String?) {
+        activeTaskId = taskId
+        notifyRefresh()
+    }
+
+    @Synchronized
+    fun setMaxTasks(n: Int) {
+        maxTasks = n
+        notifyRefresh()
+    }
+
     @Synchronized
     fun setWorkspaces(list: List<WorkspaceInfo>) {
         workspaces = list
@@ -147,8 +251,51 @@ object BridgeState {
     }
 
     @Synchronized
+    fun replaceTrace(entries: List<TraceEntry>) {
+        synchronized(traceEntries) {
+            traceEntries.clear()
+            traceEntries.addAll(entries.takeLast(Config.TRACE_MAX))
+        }
+        notifyRefresh()
+    }
+
+    @Synchronized
     fun clearTrace() {
         synchronized(traceEntries) { traceEntries.clear() }
+        streamText = ""
+        notifyRefresh()
+    }
+
+    @Synchronized
+    fun appendStreamText(text: String) {
+        streamText = (streamText + text).takeLast(4000)
+        notifyRefresh()
+    }
+
+    @Synchronized
+    fun setUploadProgress(received: Long, size: Long) {
+        uploadProgress = if (size > 0) received to size else null
+        notifyRefresh()
+    }
+
+    @Synchronized
+    fun clearUploadProgress() {
+        uploadProgress = null
+        notifyRefresh()
+    }
+
+    @Synchronized
+    fun setPendingAttachment(path: String?, name: String?) {
+        pendingAttachment = path
+        pendingAttachmentName = name
+        uploadProgress = null
+        notifyRefresh()
+    }
+
+    @Synchronized
+    fun clearPendingAttachment() {
+        pendingAttachment = null
+        pendingAttachmentName = null
         notifyRefresh()
     }
 

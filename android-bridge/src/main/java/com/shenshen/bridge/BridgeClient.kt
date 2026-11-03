@@ -1,12 +1,21 @@
 package com.shenshen.bridge
 
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
+import android.util.Base64
 import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.InputStream
+import java.security.MessageDigest
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -16,12 +25,12 @@ import kotlin.random.Random
 /**
  * 与电脑端 bridge/server.js 的长连接客户端（进程内单例）。
  *
- * 职责：
- *  - 连接 ws://<电脑TailscaleIP>:8080
- *  - 断线后指数退避重连（1s → 2s → 4s … 封顶 30s + 随机抖动）
- *  - 收到 approval-request → 写 BridgeState + 弹带按钮的通知 + 桌宠气泡 + 音效
- *  - 收集 thinking / tool_call 事件到「执行轨迹」
- *  - 提供 sendRun / sendApproval / sendStop / reconnect
+ * v4（P3）职责：
+ *  - 连接 ws://<电脑TailscaleIP>:8080，断线指数退避重连
+ *  - hello / tasks / task-state / trace / task-text / task-trace 全套 v3.2 协议
+ *  - 审批：approval-request → 通知 + 桌宠气泡 + 音效
+ *  - 多任务：requestTasks / switchTask / sendStop(taskId)
+ *  - 上传：uploadUri() 走 upload-begin/chunk/end 分片（64KB，base64）
  */
 class BridgeClient(
     private val serverUrl: String = Config.DEFAULT_SERVER_URL,
@@ -33,6 +42,7 @@ class BridgeClient(
         private const val BASE_BACKOFF_MS = 1_000L
         private const val MAX_BACKOFF_MS = 30_000L
         private const val PING_INTERVAL_SEC = 30L
+        private const val CHUNK_SIZE = 64 * 1024
 
         /** 全进程唯一实例（BridgeService 创建，UI / 通知按钮共用） */
         @Volatile
@@ -52,6 +62,13 @@ class BridgeClient(
     private val scheduler = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "bridge-reconnect").apply { isDaemon = true }
     }
+
+    private val io = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "bridge-upload").apply { isDaemon = true }
+    }
+
+    /** uploadId → 任务 id（上传完成时服务端会回 taskId） */
+    private val uploadTasks = ConcurrentHashMap<String, String>()
 
     @Volatile
     private var socket: WebSocket? = null
@@ -87,19 +104,47 @@ class BridgeClient(
         connectNow()
     }
 
-    /** 下发一次任务给电脑端 dsh。workspace = 目标工作区绝对路径（空则用服务端默认根目录） */
-    fun sendRun(prompt: String, workspace: String? = null): Boolean {
-        BridgeState.clearTrace()
+    /**
+     * 下发任务。
+     * @param workspace 目标工作区绝对路径（空 = 服务端默认根目录）
+     * @param sessionId 续跑已有会话（空 = 新任务）
+     * @param attachments 附件本地路径列表（上传后由服务端返回）
+     */
+    fun sendRun(
+        prompt: String,
+        workspace: String? = null,
+        sessionId: String? = null,
+        attachments: List<String> = emptyList(),
+    ): Boolean {
+        if (sessionId.isNullOrEmpty()) BridgeState.clearTrace()
         return sendJson { root ->
             root.put("action", "run")
             root.put("prompt", prompt)
             val ws = workspace ?: BridgeState.selectedWorkspace
             if (!ws.isNullOrBlank()) root.put("workspace", ws)
+            if (!sessionId.isNullOrBlank()) root.put("sessionId", sessionId)
+            if (attachments.isNotEmpty()) {
+                val arr = JSONArray()
+                attachments.forEach { arr.put(it) }
+                root.put("attachments", arr)
+            }
         }
     }
 
     /** 拉取电脑端工作区列表 */
     fun requestWorkspaces(): Boolean = sendJson { root -> root.put("action", "workspaces") }
+
+    /** 拉取电脑端任务列表 */
+    fun requestTasks(): Boolean = sendJson { root -> root.put("action", "tasks") }
+
+    /** 切换盯着的任务，服务端会回 task-trace 回放轨迹 */
+    fun switchTask(taskId: String): Boolean {
+        BridgeState.setActiveTask(taskId)
+        return sendJson { root ->
+            root.put("action", "switch-task")
+            root.put("taskId", taskId)
+        }
+    }
 
     /** 在电脑端新建工作区（创建目录并写入 workspace.json 注册表） */
     fun createWorkspace(path: String): Boolean = sendJson { root ->
@@ -107,8 +152,11 @@ class BridgeClient(
         root.put("path", path)
     }
 
-    /** 停止当前任务 */
-    fun sendStop(): Boolean = sendJson { root -> root.put("action", "stop") }
+    /** 停止任务；taskId 空 = 停最近一个 */
+    fun sendStop(taskId: String? = null): Boolean = sendJson { root ->
+        root.put("action", "stop")
+        if (!taskId.isNullOrBlank()) root.put("taskId", taskId)
+    }
 
     /** 审批回包：outcome ∈ allowed-once / rejected */
     fun sendApproval(callId: String, outcome: String): Boolean {
@@ -122,6 +170,96 @@ class BridgeClient(
             cancelApprovalNotification()
         }
         return ok
+    }
+
+    /**
+     * 分片上传一个文件（后台线程）：upload-begin → upload-chunk × N → upload-end。
+     * 成功后 BridgeState.pendingAttachment = 服务端落盘路径，随下一条 run 发送。
+     */
+    fun uploadUri(context: Context, uri: Uri): Boolean {
+        if (socket == null) return false
+        val resolver = context.contentResolver
+        var name = "upload_${System.currentTimeMillis()}"
+        var size = -1L
+        runCatching {
+            resolver.query(uri, null, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (ni >= 0) {
+                        val v = c.getString(ni)
+                        if (!v.isNullOrBlank()) name = v
+                    }
+                    val si = c.getColumnIndex(OpenableColumns.SIZE)
+                    if (si >= 0 && !c.isNull(si)) size = c.getLong(si)
+                }
+            }
+        }.onFailure { Log.w(TAG, "query uri failed", it) }
+        if (size <= 0) return false
+
+        val uploadId = "up-${UUID.randomUUID()}"
+        val taskId = BridgeState.activeTaskId
+        BridgeState.setUploadProgress(0L, size)
+        io.execute {
+            try {
+                val input: InputStream = resolver.openInputStream(uri)
+                    ?: throw IllegalStateException("无法打开文件流")
+                input.use { stream -> streamUpload(uploadId, stream, name, size, taskId) }
+            } catch (t: Throwable) {
+                Log.w(TAG, "upload failed", t)
+                sendJson { root ->
+                    root.put("action", "upload-abort")
+                    root.put("uploadId", uploadId)
+                }
+                BridgeState.clearUploadProgress()
+                BridgeState.setStatus(BridgeState.status, "上传失败：${t.message}")
+            }
+        }
+        return true
+    }
+
+    private fun streamUpload(
+        uploadId: String,
+        stream: InputStream,
+        name: String,
+        size: Long,
+        taskId: String?,
+    ) {
+        if (taskId != null) uploadTasks[uploadId] = taskId
+        sendJson { root ->
+            root.put("action", "upload-begin")
+            root.put("uploadId", uploadId)
+            root.put("name", name)
+            root.put("size", size)
+            if (!taskId.isNullOrBlank()) root.put("taskId", taskId)
+            val ws = BridgeState.selectedWorkspace
+            if (!ws.isNullOrBlank()) root.put("workspace", ws)
+        }
+
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(CHUNK_SIZE)
+        var received = 0L
+        while (true) {
+            val n = stream.read(buf)
+            if (n <= 0) break
+            digest.update(buf, 0, n)
+            received += n
+            val b64 = Base64.encodeToString(buf, 0, n, Base64.NO_WRAP)
+            val ok = sendJson { root ->
+                root.put("action", "upload-chunk")
+                root.put("uploadId", uploadId)
+                root.put("dataB64", b64)
+            }
+            if (!ok) throw IllegalStateException("连接已断，上传中止")
+            BridgeState.setUploadProgress(received, size)
+        }
+
+        val sha = digest.digest().joinToString("") { "%02x".format(it) }
+        sendJson { root ->
+            root.put("action", "upload-end")
+            root.put("uploadId", uploadId)
+            root.put("sha256", sha)
+        }
+        Log.i(TAG, "upload sent: $name ($received/$size) sha=$sha")
     }
 
     private inline fun sendJson(build: (JSONObject) -> Unit): Boolean {
@@ -163,7 +301,9 @@ class BridgeClient(
             reconnectPending.set(false)
             BridgeState.setStatus(BridgeState.Status.CONNECTED)
             Log.i(TAG, "connected: $serverUrl")
-            requestWorkspaces()   // 连上就顺手拉一次工作区列表
+            // hello 会带 tasks + workspaces；这里再主动补一发，防止服务端版本差异
+            requestWorkspaces()
+            requestTasks()
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -193,59 +333,186 @@ class BridgeClient(
             return
         }
         when (obj.optString("type")) {
+            "hello" -> {
+                val data = obj.optJSONObject("data") ?: JSONObject()
+                BridgeState.setMaxTasks(data.optInt("maxTasks", 2))
+                handleTasks(data.optJSONArray("tasks"))
+                handleWorkspaces(data.optJSONArray("workspaces"))
+            }
             "approval-request" -> handleApprovalRequest(obj)
             "approval-resolved" -> {
                 BridgeState.clearPendingApproval()
                 cancelApprovalNotification()
             }
-            "event" -> handleEvent(obj.optJSONObject("data") ?: obj)
+            "trace" -> handleTrace(obj.optJSONObject("data"))
+            "task-state" -> handleTaskState(obj.optJSONObject("data"))
+            "task-text" -> {
+                val data = obj.optJSONObject("data") ?: obj
+                val t = data.optString("text")
+                if (t.isNotEmpty()) BridgeState.appendStreamText(t)
+            }
+            "task-trace" -> handleTaskTrace(obj.optJSONObject("data"))
+            "tasks" -> handleTasks(obj.optJSONArray("data"))
             "task-started" -> {
                 BridgeState.setTaskRunning(true)
                 val data = obj.optJSONObject("data")
                 data?.optString("cwd")?.let { BridgeState.setCwd(it) }
+                data?.optString("taskId")?.takeIf { it.isNotEmpty() }?.let { BridgeState.setActiveTask(it) }
             }
             "task-done" -> {
                 BridgeState.setTaskRunning(false)
                 BridgeState.clearPendingApproval()
                 cancelApprovalNotification()
             }
+            "task-stopping" -> BridgeState.setTaskState("stopping")
             "session" -> {
                 val data = obj.optJSONObject("data") ?: obj
                 (data.optString("cwd").ifEmpty { null })?.let { BridgeState.setCwd(it) }
             }
-            "workspaces" -> {
-                val arr = obj.optJSONArray("data")
-                val list = ArrayList<BridgeState.WorkspaceInfo>()
-                if (arr != null) {
-                    for (i in 0 until arr.length()) {
-                        val o = arr.optJSONObject(i) ?: continue
-                        val p = o.optString("path")
-                        if (p.isEmpty()) continue
-                        list.add(
-                            BridgeState.WorkspaceInfo(
-                                id = o.optString("id"),
-                                title = o.optString("title").ifEmpty { p },
-                                path = p,
-                                exists = o.optBoolean("exists", true),
-                            ),
-                        )
-                    }
-                }
-                BridgeState.setWorkspaces(list)
-            }
+            "workspaces" -> handleWorkspaces(obj.optJSONArray("data"))
             "workspace-created" -> {
                 val data = obj.optJSONObject("data")
                 val p = data?.optString("path")
                 if (!p.isNullOrEmpty()) BridgeState.selectWorkspace(p)
             }
+            "upload-accept" -> {
+                val data = obj.optJSONObject("data")
+                val id = data?.optString("uploadId")
+                Log.i(TAG, "upload accepted: $id")
+            }
+            "upload-progress" -> {
+                val data = obj.optJSONObject("data") ?: JSONObject()
+                BridgeState.setUploadProgress(data.optLong("received"), data.optLong("size"))
+            }
+            "upload-done" -> {
+                val data = obj.optJSONObject("data") ?: JSONObject()
+                val path = data.optString("path")
+                val name = data.optString("name")
+                val id = data.optString("uploadId")
+                uploadTasks.remove(id)
+                if (path.isNotEmpty()) {
+                    BridgeState.setPendingAttachment(path, name)
+                    Log.i(TAG, "upload done → $path")
+                }
+            }
+            "upload-aborted" -> BridgeState.clearUploadProgress()
             "error" -> {
                 val data = obj.optJSONObject("data")
                 val msg = data?.optString("message") ?: obj.optString("message")
                 if (msg.isNotEmpty()) BridgeState.setStatus(BridgeState.status, msg)
+                if (BridgeState.uploadProgress != null) BridgeState.clearUploadProgress()
             }
             else -> Unit
         }
         onEvent?.invoke(obj)
+    }
+
+    private fun handleTasks(arr: JSONArray?) {
+        val list = ArrayList<BridgeState.TaskInfo>()
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val id = o.optString("taskId")
+                if (id.isEmpty()) continue
+                list.add(
+                    BridgeState.TaskInfo(
+                        taskId = id,
+                        sessionId = o.optString("sessionId").ifEmpty { null },
+                        workspaceTitle = o.optString("workspaceTitle").ifEmpty { null },
+                        cwd = o.optString("cwd").ifEmpty { null },
+                        prompt = o.optString("prompt"),
+                        state = o.optString("state", "idle"),
+                        turn = o.optInt("turn", 0),
+                        step = o.optInt("step", 0),
+                        startedAt = o.optLong("startedAt"),
+                        traceCount = o.optInt("traceCount", 0),
+                    ),
+                )
+            }
+        }
+        BridgeState.setTasks(list)
+        val active = BridgeState.activeTaskId
+        val running = list.firstOrNull { it.state == "running" }
+        if (active == null) BridgeState.setActiveTask(running?.taskId ?: list.firstOrNull()?.taskId)
+    }
+
+    private fun handleWorkspaces(arr: JSONArray?) {
+        val list = ArrayList<BridgeState.WorkspaceInfo>()
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val p = o.optString("path")
+                if (p.isEmpty()) continue
+                list.add(
+                    BridgeState.WorkspaceInfo(
+                        id = o.optString("id"),
+                        title = o.optString("title").ifEmpty { p },
+                        path = p,
+                        exists = o.optBoolean("exists", true),
+                    ),
+                )
+            }
+        }
+        BridgeState.setWorkspaces(list)
+    }
+
+    private fun handleTaskState(data: JSONObject?) {
+        if (data == null) return
+        val state = data.optString("state")
+        if (state.isEmpty()) return
+        val reason = data.optString("reason").ifEmpty { null }
+        val turn = if (data.has("turn")) data.optInt("turn") else null
+        val step = if (data.has("step")) data.optInt("step") else null
+        BridgeState.setTaskState(state, reason, turn, step)
+        if (state != "running" && state != "stopping") {
+            // 任务结束：刷新一次列表，清掉挂起审批
+            requestTasks()
+            BridgeState.clearPendingApproval()
+            cancelApprovalNotification()
+        }
+    }
+
+    private fun handleTrace(data: JSONObject?) {
+        if (data == null) return
+        val kind = data.optString("kind")
+        if (kind.isEmpty()) return
+        val brief = data.optString("brief")
+        val detail = data.optString("detail")
+        val ok = if (data.has("ok")) data.optBoolean("ok", true) else (data.optString("status") != "failed")
+        BridgeState.addTrace(
+            BridgeState.TraceEntry(
+                kind = kind,
+                brief = brief,
+                detail = detail,
+                at = data.optLong("at", System.currentTimeMillis()),
+                ok = ok,
+            ),
+        )
+    }
+
+    private fun handleTaskTrace(data: JSONObject?) {
+        if (data == null) return
+        val taskId = data.optString("taskId")
+        if (taskId.isNotEmpty()) BridgeState.setActiveTask(taskId)
+        data.optString("state").takeIf { it.isNotEmpty() }?.let { BridgeState.setTaskState(it) }
+        data.optString("cwd").takeIf { it.isNotEmpty() }?.let { BridgeState.setCwd(it) }
+        val entries = data.optJSONArray("entries")
+        val list = ArrayList<BridgeState.TraceEntry>()
+        if (entries != null) {
+            for (i in 0 until entries.length()) {
+                val o = entries.optJSONObject(i) ?: continue
+                list.add(
+                    BridgeState.TraceEntry(
+                        kind = o.optString("kind"),
+                        brief = o.optString("brief"),
+                        detail = o.optString("detail"),
+                        at = o.optLong("at", 0L),
+                        ok = if (o.has("ok")) o.optBoolean("ok", true) else true,
+                    ),
+                )
+            }
+        }
+        BridgeState.replaceTrace(list)
     }
 
     private fun handleApprovalRequest(obj: JSONObject) {
@@ -260,6 +527,9 @@ class BridgeClient(
             reason = reason,
             receivedAt = System.currentTimeMillis(),
             timeoutMs = timeout,
+            taskId = data.optString("taskId").ifEmpty { null },
+            workspace = data.optString("workspace").ifEmpty { null },
+            sessionBrief = data.optString("sessionBrief").ifEmpty { null },
         )
         BridgeState.setPendingApproval(pending)
 
@@ -283,50 +553,6 @@ class BridgeClient(
         BridgeHooks.playClick()
     }
 
-    private fun handleEvent(data: JSONObject) {
-        val kind = data.optString("type").ifEmpty { data.optString("event") }
-        when (kind) {
-            "thinking" -> {
-                val text = firstNonEmpty(data, "delta", "text", "content", "message")
-                if (text.isNotBlank()) {
-                    BridgeState.addTrace(
-                        BridgeState.TraceEntry(
-                            kind = "thinking",
-                            brief = "思考：" + text.replace('\n', ' ').take(60),
-                            detail = text,
-                            at = System.currentTimeMillis(),
-                        ),
-                    )
-                }
-            }
-            "tool_call" -> {
-                val tool = firstNonEmpty(data, "tool", "name", "toolName").ifBlank { "工具" }
-                val args = firstNonEmpty(data, "arguments", "args", "input", "argumentsText")
-                BridgeState.addTrace(
-                    BridgeState.TraceEntry(
-                        kind = "tool_call",
-                        brief = "调用 $tool" + if (args.isNotBlank()) "：" + args.replace('\n', ' ').take(50) else "",
-                        detail = "$tool\n$args",
-                        at = System.currentTimeMillis(),
-                    ),
-                )
-            }
-            else -> Unit
-        }
-    }
-
-    private fun firstNonEmpty(obj: JSONObject, vararg keys: String): String {
-        for (k in keys) {
-            val v = obj.opt(k) ?: continue
-            val s = when (v) {
-                is String -> v
-                else -> v.toString()
-            }
-            if (s.isNotBlank() && s != "null") return s
-        }
-        return ""
-    }
-
     private fun scheduleReconnect() {
         if (stopped.get()) return
         if (!reconnectPending.compareAndSet(false, true)) return
@@ -348,5 +574,5 @@ class BridgeClient(
 
     /** 由 BridgeService 在启动时注入，避免通知依赖 UI 层。 */
     @Volatile
-    var notifierContext: android.content.Context? = null
+    var notifierContext: Context? = null
 }

@@ -2,633 +2,972 @@ package com.shenshen.bridge
 
 import android.app.Activity
 import android.app.AlertDialog
-import android.graphics.BitmapFactory
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.RenderEffect
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.text.InputType
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.view.animation.AccelerateDecelerateInterpolator
-import android.animation.ValueAnimator
+import android.view.WindowManager
+import android.view.animation.LinearInterpolator
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
-import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import java.util.Locale
+import kotlin.math.roundToInt
 
 /**
- * DSH 掌上控制台 v3 · 深海鲸鱼娘主题（纯代码绘制，无 XML、无 androidx）。
+ * DSH 掌上中控台（v4 / 2.00-dsh）。
  *
- * 结构：
- *   FrameLayout
- *     ├─ ImageView   assets/bg.jpg（沉浸背景，API 31+ 轻微模糊）
- *     ├─ View        #B3000000 黑色遮罩（保证文字绝对清晰）
- *     └─ ScrollView  半透明卡片内容
+ * 深海主题：bg2.jpg 背景 + #990B1320 深色遮罩；标题下副标题「深海之下·鲸落之上·沫宁鱼」带呼吸流光。
+ * 功能：四态状态栏 / 多任务标签条（switch-task 回放）/ 审批卡片 / 轨迹四类渲染 / 工作区选择 / 📎 分片上传 / 发送 / 停止 / 重连。
  *
- * 卡片：连接状态（呼吸光环）/ 工作区选择器 / 待审批 / 下发任务 / 执行轨迹（等宽字体）
+ * 纯代码构建 UI，不依赖任何第三方库（只吃 android.jar）。
  */
 class DshDashboardActivity : Activity(), BridgeState.Refreshable {
 
-    private lateinit var glow: View
+    // ---------------------------------------------------------- 配色
+    private val colBg = Color.parseColor("#060B14")
+    private val colScrim = Color.parseColor("#990B1320")
+    private val colCard = Color.parseColor("#4D1E293B")
+    private val colCardWarn = Color.parseColor("#CC2A2418")
+    private val colTrace = Color.parseColor("#B30B1220")
+    private val colStroke = Color.parseColor("#33FFFFFF")
+    private val colText = Color.WHITE
+    private val colSub = Color.parseColor("#E2E8F0")
+    private val colDim = Color.parseColor("#94A3B8")
+    private val colAccent = Color.parseColor("#38BDF8")
+    private val colOk = Color.parseColor("#34D399")
+    private val colWarn = Color.parseColor("#FBBF24")
+    private val colDanger = Color.parseColor("#FF4D6D")
+
+    // ---------------------------------------------------------- 视图
+    private lateinit var glowDot: View
     private lateinit var dot: View
     private lateinit var statusText: TextView
-    private lateinit var approvalHeader: TextView
-    private lateinit var approvalBox: LinearLayout
+    private lateinit var subtitle: TextView
+    private lateinit var taskRow: LinearLayout
+    private lateinit var approvalCard: LinearLayout
+    private lateinit var approvalTitle: TextView
+    private lateinit var approvalBody: TextView
+    private lateinit var workspaceSpinner: Spinner
+    private lateinit var wsPathText: TextView
+    private lateinit var promptInput: EditText
+    private lateinit var attachChip: TextView
+    private lateinit var uploadText: TextView
+    private lateinit var stateText: TextView
     private lateinit var traceHeader: TextView
     private lateinit var traceBox: LinearLayout
-    private lateinit var taskStateText: TextView
     private lateinit var cwdText: TextView
-    private lateinit var wsPathText: TextView
-    private lateinit var wsSpinner: Spinner
-    private lateinit var promptInput: EditText
+    private lateinit var mainScroll: ScrollView
 
-    private var traceExpanded = false
-    private var lastTraceSig: String = ""
-    private var lastWsSig: String = ""
+    // ---------------------------------------------------------- 状态
+    private var traceOpen = true
+    private val expanded = HashSet<Int>()
     private var spinnerSyncing = false
-    private var glowAnimator: ValueAnimator? = null
+    private val ui = Handler(Looper.getMainLooper())
+    private var glowAnim: android.animation.ValueAnimator? = null
+    private var breatheAnim: android.animation.ValueAnimator? = null
 
+    // ---------------------------------------------------------- 生命周期
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        BridgeService.start(this)
-        BridgeHooks.attachContext(this)
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        try {
+            window.statusBarColor = colBg
+            window.navigationBarColor = colBg
+        } catch (_: Throwable) {
+            // 忽略：部分 ROM 不允许改
+        }
         setContentView(buildRoot())
-        BridgeState.addRefreshable(this)
-        refresh()
-        BridgeClient.shared?.requestWorkspaces()
+        BridgeService.start(this)
+        render()
     }
 
     override fun onResume() {
         super.onResume()
         BridgeState.addRefreshable(this)
+        startAnimations()
         refresh()
-        startGlow()
+        BridgeClient.shared?.let { if (!it.isConnected) it.reconnect() else it.requestTasks() }
     }
 
     override fun onPause() {
-        BridgeState.removeRefreshable(this)
-        stopGlow()
         super.onPause()
+        BridgeState.removeRefreshable(this)
+        stopAnimations()
     }
-
-    override fun onDestroy() {
-        stopGlow()
-        super.onDestroy()
-    }
-
-    // ------------------------------------------------------------ 背景
-
-    private fun buildRoot(): View {
-        val frame = FrameLayout(this).apply { setBackgroundColor(COL_BG) }
-
-        val bg = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            runCatching {
-                assets.open("bg.jpg").use { stream ->
-                    BitmapFactory.decodeStream(stream)?.let { setImageBitmap(it) }
-                }
-            }.onFailure { /* 没图就纯色底，不影响可用 */ }
-        }
-        if (Build.VERSION.SDK_INT >= 31) {
-            runCatching {
-                bg.setRenderEffect(
-                    RenderEffect.createBlurEffect(22f, 22f, Shader.TileMode.CLAMP),
-                )
-            }
-        }
-        frame.addView(bg, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ))
-
-        // 黑色遮罩 #B3000000 —— 背景亮，必须压暗才能读清字
-        frame.addView(View(this).apply { setBackgroundColor(COL_SCRIM) }, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ))
-
-        val scroll = ScrollView(this).apply { isFillViewport = true }
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(22), dp(16), dp(28))
-        }
-        scroll.addView(root)
-        frame.addView(scroll, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT,
-        ))
-
-        // ---- 标题
-        root.addView(text("DSH 控制台", 24f, COL_TITLE, bold = true))
-        root.addView(text("深海之下 · 鲸落之上 · 审批在你指尖", 12f, COL_DIM).apply {
-            setPadding(0, dp(5), 0, dp(18))
-        })
-
-        // ---- 连接状态（呼吸光环 + 圆点）
-        val statusRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val dotHolder = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(26), dp(26)).apply { rightMargin = dp(10) }
-        }
-        glow = View(this).apply {
-            background = circle(COL_ACCENT)
-            alpha = 0.25f
-            layoutParams = FrameLayout.LayoutParams(dp(14), dp(14)).apply {
-                gravity = Gravity.CENTER
-            }
-        }
-        dot = View(this).apply {
-            background = circle(COL_DIM)
-            layoutParams = FrameLayout.LayoutParams(dp(10), dp(10)).apply {
-                gravity = Gravity.CENTER
-            }
-        }
-        dotHolder.addView(glow)
-        dotHolder.addView(dot)
-        statusText = text("未连接", 14f, COL_TEXT).apply {
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        val reconnectBtn = smallButton("重连", COL_ACCENT) {
-            val c = BridgeClient.shared
-            if (c != null) c.reconnect() else {
-                BridgeService.start(this)
-                toast("正在启动桥接服务…")
-            }
-        }
-        statusRow.addView(dotHolder)
-        statusRow.addView(statusText)
-        statusRow.addView(reconnectBtn)
-        root.addView(card(statusRow))
-
-        // ---- 工作区选择器
-        root.addView(sectionLabel("工作区"))
-        val wsCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(8), dp(14), dp(12))
-            background = cardBackground()
-        }
-        val wsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        wsSpinner = Spinner(this).apply {
-            background = roundRect(COL_CARD2, dp(10), COL_STROKE)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        wsRow.addView(wsSpinner)
-        wsRow.addView(smallButton("⟳", COL_ACCENT) {
-            val ok = BridgeClient.shared?.requestWorkspaces() ?: false
-            toast(if (ok) "正在拉取工作区…" else "未连接电脑端")
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            leftMargin = dp(8)
-        })
-        val newWsBtn = smallButton("+ 新建工作区", COL_ACCENT) { showNewWorkspaceDialog() }
-        wsRow.addView(newWsBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            leftMargin = dp(8)
-        })
-        wsCard.addView(wsRow)
-        wsPathText = text("当前：—", 11f, COL_DIM).apply { setPadding(dp(2), dp(8), 0, 0) }
-        wsCard.addView(wsPathText)
-        root.addView(wsCard)
-
-        // ---- 待审批
-        approvalHeader = sectionLabel("待审批")
-        root.addView(approvalHeader)
-        approvalBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(approvalBox)
-
-        // ---- 下发任务
-        root.addView(sectionLabel("下发任务"))
-        promptInput = EditText(this).apply {
-            hint = "给电脑端的 DSH 说点什么…"
-            setHintTextColor(COL_DIM)
-            setTextColor(COL_TEXT)
-            textSize = 14f
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            minLines = 2
-            maxLines = 4
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            background = roundRect(COL_CARD2, dp(12), COL_STROKE)
-        }
-        root.addView(promptInput)
-
-        val actionRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(10), 0, 0)
-        }
-        actionRow.addView(primaryButton("发 送", COL_ACCENT, isGradient = true) { sendPrompt() },
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.4f))
-        actionRow.addView(primaryButton("停 止", COL_DANGER) {
-            val ok = BridgeClient.shared?.sendStop() ?: false
-            toast(if (ok) "已发送停止指令" else "未连接或服务未就绪")
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-            leftMargin = dp(10)
-        })
-        root.addView(actionRow)
-
-        taskStateText = text("空闲", 12f, COL_DIM).apply { setPadding(dp(2), dp(10), 0, 0) }
-        root.addView(taskStateText)
-
-        // ---- 执行轨迹（可折叠、等宽字体）
-        traceHeader = sectionLabel("执行轨迹 (0) ▶").apply {
-            isClickable = true
-            setOnClickListener {
-                traceExpanded = !traceExpanded
-                traceBox.visibility = if (traceExpanded) View.VISIBLE else View.GONE
-                renderTraceHeader()
-            }
-        }
-        root.addView(traceHeader)
-        traceBox = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(10), dp(10), dp(10), dp(10))
-            background = roundRect(COL_TRACE, dp(12), COL_STROKE)
-            visibility = View.GONE
-        }
-        root.addView(traceBox)
-
-        // ---- 工作区底部提示（任务真实 cwd）
-        cwdText = text("任务 cwd：—", 11f, COL_DIM).apply { setPadding(dp(2), dp(18), 0, 0) }
-        root.addView(cwdText)
-
-        return frame
-    }
-
-    // ------------------------------------------------------------ 呼吸光环
-
-    private fun startGlow() {
-        if (glowAnimator != null) return
-        glowAnimator = ValueAnimator.ofFloat(0.12f, 0.5f).apply {
-            duration = 1600
-            repeatCount = ValueAnimator.INFINITE
-            repeatMode = ValueAnimator.REVERSE
-            interpolator = AccelerateDecelerateInterpolator()
-            addUpdateListener { a ->
-                val v = a.animatedValue as Float
-                glow.alpha = v
-                val s = 1f + v
-                glow.scaleX = s
-                glow.scaleY = s
-            }
-            start()
-        }
-    }
-
-    private fun stopGlow() {
-        glowAnimator?.cancel()
-        glowAnimator = null
-    }
-
-    // ------------------------------------------------------------ 刷新
 
     override fun refresh() {
-        runOnUiThread {
-            renderStatus()
-            renderWorkspaces()
-            renderApproval()
-            renderTaskState()
-            renderTraceHeader()
-            if (traceExpanded) renderTraceBody()
-            cwdText.text = "任务 cwd：" + (BridgeState.lastCwd ?: "—")
+        if (Looper.myLooper() == Looper.getMainLooper()) render() else ui.post { render() }
+    }
+
+    // ---------------------------------------------------------- 根布局
+    private fun buildRoot(): View {
+        val root = FrameLayout(this)
+        root.setBackgroundColor(colBg)
+
+        val bg = ImageView(this)
+        bg.scaleType = ImageView.ScaleType.CENTER_CROP
+        runCatching {
+            assets.open("bg2.jpg").use { input ->
+                bg.setImageBitmap(android.graphics.BitmapFactory.decodeStream(input))
+            }
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            // 不做模糊（性能优先），仅让底图稍暗一点
+        }
+        root.addView(
+            bg,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+
+        val scrim = View(this)
+        scrim.setBackgroundColor(colScrim)
+        root.addView(
+            scrim,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+
+        mainScroll = ScrollView(this)
+        mainScroll.isFillViewport = true
+        mainScroll.setPadding(0, 0, 0, 0)
+
+        val content = LinearLayout(this)
+        content.orientation = LinearLayout.VERTICAL
+        // 顶部多留 32dp，避开状态栏 / 灵动岛
+        content.setPadding(dp(16), dp(32) + insetsTop(), dp(16), dp(28))
+
+        content.addView(buildHeader())
+        content.addView(space(14))
+        content.addView(buildStatusRow())
+        content.addView(space(12))
+        content.addView(buildTaskTabs())
+        content.addView(space(12))
+        content.addView(buildApprovalCard())
+        content.addView(space(12))
+        content.addView(buildWorkspaceRow())
+        content.addView(space(12))
+        content.addView(buildInputCard())
+        content.addView(space(12))
+        content.addView(buildStateRow())
+        content.addView(space(12))
+        content.addView(buildTracePanel())
+        content.addView(space(10))
+        content.addView(buildCwdRow())
+
+        mainScroll.addView(content)
+        root.addView(
+            mainScroll,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        return root
+    }
+
+    private fun insetsTop(): Int {
+        return 0
+    }
+
+    // ---------------------------------------------------------- 头部
+    private fun buildHeader(): View {
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+
+        val title = TextView(this)
+        title.text = "DSH 控制台"
+        title.setTextColor(colText)
+        title.textSize = 26f
+        title.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        title.letterSpacing = 0.04f
+        box.addView(title)
+
+        subtitle = TextView(this)
+        subtitle.text = "深海之下 · 鲸落之上 · 沫宁鱼"
+        subtitle.setTextColor(colAccent)
+        subtitle.textSize = 13f
+        subtitle.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        subtitle.letterSpacing = 0.06f
+        val lp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        lp.topMargin = dp(6)
+        box.addView(subtitle, lp)
+        return box
+    }
+
+    // ---------------------------------------------------------- 状态灯 + 重连
+    private fun buildStatusRow(): View {
+        val card = roundedCard(colCard, 16)
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(dp(14), dp(12), dp(14), dp(12))
+
+        val dotBox = FrameLayout(this)
+        glowDot = View(this)
+        runCatching {
+            glowDot.setBackground(circle(Color.parseColor("#5538BDF8")))
+            dot = View(this)
+            dot.setBackground(circle(colDim))
+        }
+        dotBox.addView(
+            glowDot,
+            FrameLayout.LayoutParams(dp(42), dp(42)).also { it.gravity = Gravity.CENTER },
+        )
+        dotBox.addView(
+            dot,
+            FrameLayout.LayoutParams(dp(14), dp(14)).also { it.gravity = Gravity.CENTER },
+        )
+        row.addView(dotBox, LinearLayout.LayoutParams(dp(46), dp(46)))
+
+        statusText = TextView(this)
+        statusText.text = "未连接"
+        statusText.setTextColor(colText)
+        statusText.textSize = 15f
+        statusText.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        val tlp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        tlp.leftMargin = dp(6)
+        row.addView(statusText, tlp)
+
+        val reconnect = smallButton("重连", colAccent)
+        reconnect.setOnClickListener {
+            Toast.makeText(this, "正在重连…", Toast.LENGTH_SHORT).show()
+            BridgeClient.shared?.reconnect()
+        }
+        row.addView(reconnect)
+
+        card.addView(row)
+        return card
+    }
+
+    // ---------------------------------------------------------- 任务标签条
+    private fun buildTaskTabs(): View {
+        val wrap = LinearLayout(this)
+        wrap.orientation = LinearLayout.VERTICAL
+
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+
+        val label = TextView(this)
+        label.text = "任务"
+        label.setTextColor(colDim)
+        label.textSize = 12f
+        head.addView(label)
+
+        val newTask = TextView(this)
+        newTask.text = "＋ 新任务"
+        newTask.setTextColor(colAccent)
+        newTask.textSize = 12f
+        newTask.setPadding(dp(10), dp(4), dp(10), dp(4))
+        newTask.setOnClickListener {
+            BridgeState.setActiveTask(null)
+            BridgeState.clearTrace()
+            BridgeState.setTaskState("idle")
+            promptInput.setText("")
+            promptInput.requestFocus()
+            Toast.makeText(this, "下一条发送将作为新任务", Toast.LENGTH_SHORT).show()
+            render()
+        }
+        val nlp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        nlp.leftMargin = dp(10)
+        head.addView(newTask, nlp)
+        wrap.addView(head)
+
+        val hsv = HorizontalScrollView(this)
+        hsv.isHorizontalScrollBarEnabled = false
+        taskRow = LinearLayout(this)
+        taskRow.orientation = LinearLayout.HORIZONTAL
+        taskRow.setPadding(0, dp(8), 0, 0)
+        hsv.addView(taskRow)
+        wrap.addView(hsv)
+        return wrap
+    }
+
+    // ---------------------------------------------------------- 审批卡片
+    private fun buildApprovalCard(): View {
+        approvalCard = roundedCard(colCardWarn, 16)
+        approvalCard.orientation = LinearLayout.VERTICAL
+        approvalCard.setPadding(dp(14), dp(12), dp(14), dp(12))
+        approvalCard.visibility = View.GONE
+
+        approvalTitle = TextView(this)
+        approvalTitle.text = "待审批"
+        approvalTitle.setTextColor(colWarn)
+        approvalTitle.textSize = 13f
+        approvalTitle.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        approvalCard.addView(approvalTitle)
+
+        approvalBody = TextView(this)
+        approvalBody.setTextColor(colSub)
+        approvalBody.textSize = 13f
+        approvalBody.setPadding(0, dp(6), 0, dp(10))
+        approvalCard.addView(approvalBody)
+
+        val btns = LinearLayout(this)
+        btns.orientation = LinearLayout.HORIZONTAL
+
+        val allow = smallButton("允许一次", colOk)
+        val deny = smallButton("拒绝", colDanger)
+        val lp1 = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        val lp2 = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        lp2.leftMargin = dp(10)
+        btns.addView(allow, lp1)
+        btns.addView(deny, lp2)
+        allow.setOnClickListener { decide(true) }
+        deny.setOnClickListener { decide(false) }
+        approvalCard.addView(btns)
+        return approvalCard
+    }
+
+    // ---------------------------------------------------------- 工作区
+    private fun buildWorkspaceRow(): View {
+        val card = roundedCard(colCard, 16)
+        card.orientation = LinearLayout.VERTICAL
+        card.setPadding(dp(14), dp(10), dp(14), dp(12))
+
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.HORIZONTAL
+        head.gravity = Gravity.CENTER_VERTICAL
+
+        val label = TextView(this)
+        label.text = "工作区"
+        label.setTextColor(colDim)
+        label.textSize = 12f
+        head.addView(label)
+
+        workspaceSpinner = Spinner(this)
+        val slp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        slp.leftMargin = dp(10)
+        head.addView(workspaceSpinner, slp)
+
+        val reload = smallButton("⟳", colDim)
+        reload.setOnClickListener { BridgeClient.shared?.requestWorkspaces() }
+        head.addView(reload)
+
+        val create = smallButton("＋", colAccent)
+        val clp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        clp.leftMargin = dp(8)
+        create.setOnClickListener { askCreateWorkspace() }
+        head.addView(create, clp)
+        card.addView(head)
+
+        wsPathText = TextView(this)
+        wsPathText.setTextColor(colDim)
+        wsPathText.textSize = 10.5f
+        wsPathText.setPadding(0, dp(6), 0, 0)
+        card.addView(wsPathText)
+        return card
+    }
+
+    // ---------------------------------------------------------- 输入卡
+    private fun buildInputCard(): View {
+        val card = roundedCard(colCard, 16)
+        card.orientation = LinearLayout.VERTICAL
+        card.setPadding(dp(14), dp(12), dp(14), dp(12))
+
+        promptInput = EditText(this)
+        promptInput.hint = "告诉 DSH 要做什么…"
+        promptInput.setTextColor(colText)
+        promptInput.setHintTextColor(colDim)
+        promptInput.textSize = 14f
+        promptInput.background = rounded(colTrace, 12, colStroke, 1)
+        promptInput.setPadding(dp(12), dp(10), dp(12), dp(10))
+        promptInput.minLines = 2
+        promptInput.maxLines = 6
+        promptInput.gravity = Gravity.TOP or Gravity.START
+        promptInput.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        card.addView(promptInput)
+
+        uploadText = TextView(this)
+        uploadText.setTextColor(colAccent)
+        uploadText.textSize = 11f
+        uploadText.setPadding(dp(2), dp(8), 0, 0)
+        uploadText.visibility = View.GONE
+        card.addView(uploadText)
+
+        attachChip = TextView(this)
+        attachChip.text = ""
+        attachChip.setTextColor(colSub)
+        attachChip.textSize = 11f
+        attachChip.setPadding(dp(2), dp(6), 0, 0)
+        attachChip.visibility = View.GONE
+        attachChip.setOnClickListener {
+            BridgeState.clearPendingAttachment()
+            render()
+        }
+        card.addView(attachChip)
+
+        val btns = LinearLayout(this)
+        btns.orientation = LinearLayout.HORIZONTAL
+        btns.gravity = Gravity.CENTER_VERTICAL
+        val blp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        blp.topMargin = dp(10)
+        card.addView(btns, blp)
+
+        val attach = actionButton("📎 上传", Color.parseColor("#1E293B"), colAccent)
+        attach.setOnClickListener { pickFile() }
+        btns.addView(
+            attach,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+
+        val send = actionButtonGradient("发送")
+        send.setOnClickListener { sendPrompt() }
+        val sendLp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        sendLp.leftMargin = dp(8)
+        btns.addView(send, sendLp)
+
+        val stop = actionButton("停止", colDanger, Color.WHITE)
+        stop.setOnClickListener {
+            BridgeClient.shared?.sendStop(BridgeState.activeTaskId)
+            Toast.makeText(this, "已发送停止指令", Toast.LENGTH_SHORT).show()
+        }
+        val stopLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        stopLp.leftMargin = dp(8)
+        btns.addView(stop, stopLp)
+        return card
+    }
+
+    // ---------------------------------------------------------- 四态状态行
+    private fun buildStateRow(): View {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.setPadding(dp(4), 0, dp(4), 0)
+
+        stateText = TextView(this)
+        stateText.setTextColor(colDim)
+        stateText.textSize = 12f
+        stateText.text = "空闲"
+        row.addView(stateText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        val turnText = TextView(this)
+        turnText.text = ""
+        turnText.setTextColor(colDim)
+        turnText.textSize = 11f
+        row.addView(turnText)
+        this.turnView = turnText
+        return row
+    }
+
+    private var turnView: TextView? = null
+
+    // ---------------------------------------------------------- 轨迹面板
+    private fun buildTracePanel(): View {
+        val card = roundedCard(colTrace, 14)
+        card.orientation = LinearLayout.VERTICAL
+        card.setPadding(dp(12), dp(10), dp(12), dp(10))
+
+        traceHeader = TextView(this)
+        traceHeader.setTextColor(colAccent)
+        traceHeader.textSize = 12f
+        traceHeader.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        traceHeader.text = "▼ 执行轨迹"
+        traceHeader.setOnClickListener {
+            traceOpen = !traceOpen
+            render()
+        }
+        card.addView(traceHeader)
+
+        traceBox = LinearLayout(this)
+        traceBox.orientation = LinearLayout.VERTICAL
+        traceBox.setPadding(0, dp(8), 0, 0)
+        card.addView(traceBox)
+        return card
+    }
+
+    private fun buildCwdRow(): View {
+        cwdText = TextView(this)
+        cwdText.setTextColor(colDim)
+        cwdText.textSize = 10f
+        cwdText.maxLines = 2
+        cwdText.typeface = Typeface.MONOSPACE
+        return cwdText
+    }
+
+    // ---------------------------------------------------------- 渲染
+    private fun render() {
+        if (!this::statusText.isInitialized) return
+        renderStatus()
+        renderTaskTabs()
+        renderApproval()
+        renderWorkspace()
+        renderInput()
+        renderState()
+        renderTrace()
+        renderCwd()
     }
 
     private fun renderStatus() {
-        val (color, label) = when (BridgeState.status) {
-            BridgeState.Status.CONNECTED -> COL_OK to "已连接电脑端"
-            BridgeState.Status.CONNECTING -> COL_WARN to "正在连接…"
-            BridgeState.Status.RECONNECTING -> COL_WARN to "重连中…"
-            BridgeState.Status.DISCONNECTED -> COL_DANGER to "未连接"
+        val st = BridgeState.status
+        val (color, text) = when (st) {
+            BridgeState.Status.CONNECTED -> colOk to "已连接"
+            BridgeState.Status.CONNECTING -> colAccent to "连接中…"
+            BridgeState.Status.RECONNECTING -> colWarn to "重新连接中…"
+            BridgeState.Status.DISCONNECTED -> colDanger to "未连接"
         }
-        dot.background = circle(color)
-        glow.background = circle(color)
+        runCatching { dot.setBackground(circle(color)) }
+        runCatching { glowDot.setBackground(circle(withAlpha(color, 0x55))) }
+        statusText.text = text
+        statusText.setTextColor(color)
         val err = BridgeState.lastError
-        statusText.text = if (err.isNullOrBlank()) label else "$label · $err"
-        statusText.setTextColor(if (err.isNullOrBlank()) COL_TEXT else COL_WARN)
+        if (!err.isNullOrBlank() && st != BridgeState.Status.CONNECTED) {
+            statusText.text = "$text · ${err.take(40)}"
+        }
     }
 
-    private fun renderWorkspaces() {
-        val list = BridgeState.workspaces
-        val sig = list?.joinToString("|") { it.id + it.path } ?: "null"
-        if (sig != lastWsSig) {
-            lastWsSig = sig
-            spinnerSyncing = true
-            val labels = (list ?: emptyList()).map { ws ->
-                (if (ws.exists) "" else "⚠ ") + ws.title
-            }
-            val adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, labels) {
-                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-                    val tv = (super.getView(position, convertView, parent) as TextView)
-                    tv.setTextColor(COL_TEXT)
-                    tv.textSize = 13f
-                    tv.setPadding(dp(10), dp(8), dp(10), dp(8))
-                    return tv
-                }
-
-                override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
-                    val tv = (super.getDropDownView(position, convertView, parent) as TextView)
-                    tv.setTextColor(COL_TEXT)
-                    tv.textSize = 13f
-                    tv.setBackgroundColor(COL_CARD_SOLID)
-                    tv.setPadding(dp(10), dp(10), dp(10), dp(10))
-                    return tv
-                }
-            }
-            wsSpinner.adapter = adapter
-            wsSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                    if (spinnerSyncing) return
-                    val ws = BridgeState.workspaces?.getOrNull(position) ?: return
-                    BridgeState.selectWorkspace(ws.path)
-                }
-
-                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-            }
-            // 回填当前选中项
-            val sel = BridgeState.selectedWorkspace
-            val idx = (BridgeState.workspaces ?: emptyList()).indexOfFirst { it.path == sel }
-            if (idx >= 0) wsSpinner.setSelection(idx)
-            spinnerSyncing = false
+    private fun renderTaskTabs() {
+        if (!this::taskRow.isInitialized) return
+        taskRow.removeAllViews()
+        val tasks = BridgeState.tasks
+        if (tasks.isEmpty()) {
+            val empty = TextView(this)
+            empty.text = "还没有任务"
+            empty.setTextColor(colDim)
+            empty.textSize = 11f
+            taskRow.addView(empty)
+            return
         }
-        wsPathText.text = "当前：" + (BridgeState.selectedWorkspace ?: "未选择（用服务端默认目录）")
-        if (list == null) wsPathText.text = "当前：正在拉取工作区…"
+        val active = BridgeState.activeTaskId
+        for (t in tasks) {
+            val chip = TextView(this)
+            val color = colorForState(t.state)
+            chip.text = "${t.taskId} · ${shortState(t.state)}"
+            chip.setTextColor(if (t.taskId == active) Color.WHITE else colSub)
+            chip.textSize = 11.5f
+            chip.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            chip.setPadding(dp(10), dp(5), dp(10), dp(5))
+            val bg = rounded(colTrace, 10, if (t.taskId == active) color else colStroke, if (t.taskId == active) 2 else 1)
+            chip.background = bg
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+            lp.rightMargin = dp(8)
+            chip.setOnClickListener {
+                BridgeClient.shared?.switchTask(t.taskId)
+                render()
+            }
+            taskRow.addView(chip, lp)
+        }
     }
 
     private fun renderApproval() {
-        approvalBox.removeAllViews()
-        val pending = BridgeState.pendingApproval
-        if (pending == null) {
-            approvalHeader.text = "待审批"
-            approvalBox.addView(text("此刻海面平静，没有待审批请求", 12f, COL_DIM).apply {
-                setPadding(dp(2), 0, 0, dp(2))
-            })
+        if (!this::approvalCard.isInitialized) return
+        val p = BridgeState.pendingApproval
+        if (p == null) {
+            approvalCard.visibility = View.GONE
             return
         }
-        approvalHeader.text = "待审批 (1)"
-        val cardView = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = roundRect(COL_CARD_WARN, dp(14), COL_WARN)
+        approvalCard.visibility = View.VISIBLE
+        val wsTitle = BridgeState.tasks.firstOrNull { it.taskId == p.taskId }?.workspaceTitle
+            ?: p.workspace
+        val brief = p.sessionBrief ?: BridgeState.tasks.firstOrNull { it.taskId == p.taskId }?.prompt
+        val head = buildString {
+            append("待审批 · ")
+            append(p.toolName.ifBlank { "工具" })
         }
-        cardView.addView(text("${pending.toolName.ifBlank { "工具" }} 请求放行", 14f, COL_TEXT, bold = true))
-        if (pending.reason.isNotBlank()) {
-            cardView.addView(text(pending.reason, 12f, COL_SUB).apply {
-                setPadding(0, dp(6), 0, 0)
-            })
+        approvalTitle.text = head
+        val body = buildString {
+            if (!wsTitle.isNullOrBlank()) append("[$wsTitle]  ")
+            if (!brief.isNullOrBlank()) append(brief.take(28)).append(if (brief.length > 28) "…  " else "  ")
+            append("\n")
+            append(p.reason.ifBlank { "（无原因描述）" }.take(220))
+            append("\n超时 ")
+            append(p.timeoutMs / 1000)
+            append("s 后自动拒绝")
         }
-        cardView.addView(text("${pending.timeoutMs / 1000} 秒无响应将自动拒绝", 11f, COL_DIM).apply {
-            setPadding(0, dp(6), 0, 0)
-        })
-
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(10), 0, 0)
-        }
-        row.addView(primaryButton("允许一次", COL_OK) {
-            decide(pending.id, Config.DECISION_ALLOW_ONCE)
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(primaryButton("拒绝", COL_DANGER) {
-            decide(pending.id, Config.DECISION_REJECT)
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-            leftMargin = dp(10)
-        })
-        cardView.addView(row)
-        approvalBox.addView(cardView)
+        approvalBody.text = body
     }
 
-    private fun renderTaskState() {
-        taskStateText.text = if (BridgeState.taskRunning) "任务执行中…" else "空闲"
-        taskStateText.setTextColor(if (BridgeState.taskRunning) COL_WARN else COL_DIM)
-    }
-
-    private fun renderTraceHeader() {
-        val n = BridgeState.trace().size
-        traceHeader.text = "执行轨迹 ($n) " + if (traceExpanded) "▼" else "▶"
-    }
-
-    private fun renderTraceBody() {
-        val entries = BridgeState.trace()
-        val sig = entries.joinToString("|") { it.at.toString() + it.kind }
-        if (sig == lastTraceSig && traceBox.childCount == entries.size) return
-        lastTraceSig = sig
-        traceBox.removeAllViews()
-        if (entries.isEmpty()) {
-            traceBox.addView(text("暂无轨迹（发出任务后这里会滚动出现）", 12f, COL_DIM).apply {
-                setTypeface(Typeface.MONOSPACE)
-            })
-            return
-        }
-        for (e in entries) {
-            val row = TextView(this).apply {
-                text = "▶ " + e.brief
-                setTextColor(if (e.kind == "tool_call") COL_ACCENT else COL_SUB)
-                textSize = 11.5f
-                typeface = Typeface.MONOSPACE
-                setPadding(dp(6), dp(7), dp(6), dp(7))
-                isClickable = true
-                setOnClickListener {
-                    text = if (text.startsWith("▶")) {
-                        "▼ " + e.brief + "\n" + e.detail
-                    } else {
-                        "▶ " + e.brief
-                    }
-                }
+    private fun renderWorkspace() {
+        if (!this::workspaceSpinner.isInitialized) return
+        val list = BridgeState.workspaces ?: emptyList()
+        val titles = list.map { "${it.title}${if (it.exists) "" else "（缺失）"}" }
+        spinnerSyncing = true
+        val adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_spinner_item, titles) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val tv = super.getView(position, convertView, parent) as TextView
+                tv.setTextColor(colSub)
+                tv.textSize = 12f
+                tv.setPadding(0, dp(2), 0, dp(2))
+                return tv
             }
-            traceBox.addView(row, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { bottomMargin = dp(4) })
+
+            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val tv = super.getDropDownView(position, convertView, parent) as TextView
+                tv.setTextColor(Color.parseColor("#0B1220"))
+                tv.textSize = 13f
+                tv.setPadding(dp(12), dp(10), dp(12), dp(10))
+                tv.setBackgroundColor(Color.parseColor("#E2E8F0"))
+                return tv
+            }
+        }
+        workspaceSpinner.adapter = adapter
+        val selectedPath = BridgeState.selectedWorkspace
+        val idx = list.indexOfFirst { it.path == selectedPath }
+        if (idx >= 0) workspaceSpinner.setSelection(idx, false)
+        workspaceSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (spinnerSyncing) return
+                list.getOrNull(position)?.let { BridgeState.selectWorkspace(it.path) }
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+        spinnerSyncing = false
+        wsPathText.text = BridgeState.selectedWorkspace ?: "（未选择 · 使用服务端默认根目录）"
+    }
+
+    private fun renderInput() {
+        if (!this::uploadText.isInitialized) return
+        val prog = BridgeState.uploadProgress
+        if (prog != null) {
+            uploadText.visibility = View.VISIBLE
+            uploadText.text = String.format(
+                Locale.US,
+                "上传中… %s / %s",
+                humanSize(prog.first),
+                humanSize(prog.second),
+            )
+        } else {
+            uploadText.visibility = View.GONE
+        }
+        val path = BridgeState.pendingAttachment
+        if (!path.isNullOrBlank()) {
+            attachChip.visibility = View.VISIBLE
+            attachChip.text = "📎 ${BridgeState.pendingAttachmentName ?: "附件"} · 点我移除"
+        } else {
+            attachChip.visibility = View.GONE
         }
     }
 
-    // ------------------------------------------------------------ 动作
+    private fun renderState() {
+        if (!this::stateText.isInitialized) return
+        val state = BridgeState.taskState
+        val color = colorForState(state)
+        val label = when (state) {
+            "running" -> "执行中"
+            "success" -> "已完成"
+            "failed" -> "失败"
+            "stopped" -> "已停止"
+            "stopping" -> "正在停止…"
+            else -> "空闲"
+        }
+        stateText.text = if (state == "idle") label else "$label · ${shortState(state)}"
+        stateText.setTextColor(color)
+        turnView?.text = "turn ${BridgeState.turn} · step ${BridgeState.step}"
+        if (state == "failed" && !BridgeState.taskReason.isNullOrBlank()) {
+            stateText.text = "失败 · ${BridgeState.taskReason!!.take(60)}"
+        }
+    }
+
+    private fun renderTrace() {
+        if (!this::traceBox.isInitialized) return
+        traceHeader.text = if (traceOpen) "▼ 执行轨迹" else "▶ 执行轨迹"
+        traceBox.visibility = if (traceOpen) View.VISIBLE else View.GONE
+        if (!traceOpen) return
+        traceBox.removeAllViews()
+        val entries = BridgeState.trace()
+        if (entries.isEmpty()) {
+            val empty = TextView(this)
+            empty.text = "（暂无）"
+            empty.setTextColor(colDim)
+            empty.textSize = 10.5f
+            empty.typeface = Typeface.MONOSPACE
+            traceBox.addView(empty)
+            return
+        }
+        entries.forEachIndexed { index, e ->
+            val row = TextView(this)
+            val isOpen = expanded.contains(index)
+            val arrow = if (isOpen) "▼" else "▶"
+            val head = when (e.kind) {
+                "thinking" -> "思考"
+                "tool_call" -> "调用"
+                "tool_result" -> if (e.ok) "结果" else "失败"
+                "final" -> "完成"
+                else -> e.kind
+            }
+            row.text = if (isOpen) {
+                "$arrow $head · ${e.brief}\n${e.detail.take(1400)}"
+            } else {
+                "$arrow $head · ${e.brief}"
+            }
+            row.setTextColor(if (e.ok) colSub else colDanger)
+            row.textSize = 10.5f
+            row.typeface = Typeface.MONOSPACE
+            row.setPadding(0, dp(3), 0, dp(3))
+            row.setOnClickListener {
+                if (expanded.contains(index)) expanded.remove(index) else expanded.add(index)
+                render()
+            }
+            traceBox.addView(row)
+        }
+    }
+
+    private fun renderCwd() {
+        if (!this::cwdText.isInitialized) return
+        cwdText.text = "cwd: ${BridgeState.lastCwd ?: "—"}"
+    }
+
+    // ---------------------------------------------------------- 交互
+    private fun decide(allow: Boolean) {
+        val p = BridgeState.pendingApproval ?: return
+        val outcome = if (allow) Config.DECISION_ALLOW_ONCE else Config.DECISION_REJECT
+        BridgeClient.shared?.sendApproval(p.id, outcome)
+        BridgeState.clearPendingApproval()
+        ApprovalNotifier.cancelApproval(this)
+        Toast.makeText(this, if (allow) "已允许（一次）" else "已拒绝", Toast.LENGTH_SHORT).show()
+        render()
+    }
 
     private fun sendPrompt() {
-        val prompt = promptInput.text?.toString()?.trim().orEmpty()
-        if (prompt.isEmpty()) {
-            toast("先写点任务内容")
+        val text = promptInput.text?.toString()?.trim().orEmpty()
+        if (text.isEmpty()) {
+            Toast.makeText(this, "先说点什么~", Toast.LENGTH_SHORT).show()
             return
         }
         val client = BridgeClient.shared
-        if (client == null) {
-            BridgeService.start(this)
-            toast("桥接服务未就绪，正在启动…")
+        if (client == null || !client.isConnected) {
+            Toast.makeText(this, "还没连上电脑端", Toast.LENGTH_SHORT).show()
             return
         }
-        val ws = BridgeState.selectedWorkspace
-        val ok = client.sendRun(prompt, ws)
-        if (ok) {
-            promptInput.setText("")
-            toast(if (ws.isNullOrBlank()) "已下发（默认工作区）" else "已下发到 " + ws.substringAfterLast('\\'))
+        val attachments = ArrayList<String>()
+        BridgeState.pendingAttachment?.let { attachments.add(it) }
+        client.sendRun(
+            prompt = text,
+            workspace = BridgeState.selectedWorkspace,
+            attachments = attachments,
+        )
+        BridgeState.clearPendingAttachment()
+        promptInput.setText("")
+        expanded.clear()
+        Toast.makeText(this, "已发送", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun pickFile() {
+        val intent = Intent(Intent.ACTION_GET_CONTENT)
+        intent.type = "*/*"
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        runCatching { startActivityForResult(Intent.createChooser(intent, "选择要上传的文件"), REQ_FILE) }
+            .onFailure { Toast.makeText(this, "打不开文件选择器", Toast.LENGTH_SHORT).show() }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQ_FILE || resultCode != RESULT_OK) return
+        val uri: Uri = data?.data ?: return
+        val ok = BridgeClient.shared?.uploadUri(this, uri) ?: false
+        if (!ok) {
+            Toast.makeText(this, "上传未开始（未连接或文件过大）", Toast.LENGTH_SHORT).show()
         } else {
-            toast("未连接电脑端")
+            Toast.makeText(this, "开始分片上传…", Toast.LENGTH_SHORT).show()
         }
     }
 
-    private fun decide(id: String, decision: String) {
-        val ok = BridgeClient.shared?.sendApproval(id, decision) ?: false
-        if (ok) {
-            ApprovalNotifier.cancelApproval(this)
-            BridgeState.clearPendingApproval()
-        } else {
-            toast("回包失败：连接已断")
-        }
-    }
-
-    private fun showNewWorkspaceDialog() {
-        val client = BridgeClient.shared
-        if (client == null) {
-            toast("未连接电脑端")
-            return
-        }
-        val input = EditText(this).apply {
-            hint = "D:\\DeepSeekHarness\\my-project"
-            setHintTextColor(COL_DIM)
-            setTextColor(COL_TEXT)
-            textSize = 14f
-            setSingleLine(true)
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-        }
+    private fun askCreateWorkspace() {
+        val input = EditText(this)
+        input.hint = "D:\\DeepSeekHarness\\my-project"
+        input.setTextColor(Color.parseColor("#0B1220"))
+        input.setHintTextColor(Color.parseColor("#64748B"))
+        input.setPadding(dp(12), dp(10), dp(12), dp(10))
         AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_NoActionBar)
             .setTitle("新建工作区")
-            .setMessage("输入电脑端的绝对路径，会在电脑上创建目录并写入 DSH 工作区注册表。")
+            .setMessage("填电脑上的绝对路径（不存在会自动创建）")
             .setView(input)
             .setPositiveButton("创建") { _, _ ->
                 val p = input.text?.toString()?.trim().orEmpty()
                 if (p.isEmpty()) {
-                    toast("路径不能为空")
+                    Toast.makeText(this, "路径不能为空", Toast.LENGTH_SHORT).show()
                 } else {
-                    val ok = client.createWorkspace(p)
-                    toast(if (ok) "已提交创建请求…" else "发送失败：未连接")
+                    BridgeClient.shared?.createWorkspace(p)
                 }
             }
             .setNegativeButton("取消", null)
             .show()
     }
 
-    // ------------------------------------------------------------ 小工具
+    // ---------------------------------------------------------- 动画
+    private fun startAnimations() {
+        stopAnimations()
+        val glow = android.animation.ValueAnimator.ofFloat(0.25f, 0.85f)
+        glow.duration = 1600
+        glow.repeatCount = android.animation.ValueAnimator.INFINITE
+        glow.repeatMode = android.animation.ValueAnimator.REVERSE
+        glow.interpolator = LinearInterpolator()
+        glow.addUpdateListener { glowDot.alpha = it.animatedValue as Float }
+        glow.start()
+        glowAnim = glow
 
-    private fun sectionLabel(value: String): TextView {
-        return text(value, 13f, COL_ACCENT, bold = true).apply {
-            setPadding(dp(2), dp(18), 0, dp(8))
-        }
+        val breathe = android.animation.ValueAnimator.ofFloat(0.45f, 1f)
+        breathe.duration = 1500
+        breathe.repeatCount = android.animation.ValueAnimator.INFINITE
+        breathe.repeatMode = android.animation.ValueAnimator.REVERSE
+        breathe.addUpdateListener { subtitle.alpha = it.animatedValue as Float }
+        breathe.start()
+        breatheAnim = breathe
     }
 
-    private fun text(value: String, size: Float, color: Int, bold: Boolean = false): TextView {
-        return TextView(this).apply {
-            text = value
-            textSize = size
-            setTextColor(color)
-            if (bold) setTypeface(typeface, Typeface.BOLD)
-        }
+    private fun stopAnimations() {
+        runCatching { glowAnim?.cancel() }
+        runCatching { breatheAnim?.cancel() }
+        glowAnim = null
+        breatheAnim = null
     }
 
-    private fun card(child: View): View {
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = cardBackground()
-        }
-        box.addView(child)
-        return box
+    // ---------------------------------------------------------- UI 工具
+    private fun space(dp: Int): View {
+        val v = View(this)
+        v.layoutParams = LinearLayout.LayoutParams(1, this.dp(dp))
+        return v
     }
 
-    /** 半透明圆角卡片：#4D1E293B，透出背后的深海蓝 */
-    private fun cardBackground(): GradientDrawable = roundRect(COL_CARD, dp(14), COL_STROKE)
+    private fun dp(value: Int): Int =
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics).roundToInt()
 
-    private fun smallButton(label: String, color: Int, onClick: () -> Unit): Button {
-        return Button(this).apply {
-            text = label
-            textSize = 12f
-            setTextColor(color)
-            isAllCaps = false
-            background = roundRect(COL_CARD2, dp(18), color)
-            setPadding(dp(14), dp(4), dp(14), dp(4))
-            minimumWidth = 0
-            minWidth = 0
-            minimumHeight = 0
-            minHeight = 0
-            setOnClickListener { onClick() }
-        }
+    private fun roundedCard(color: Int, radius: Int): LinearLayout {
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.background = rounded(color, radius, colStroke, 1)
+        val lp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        card.layoutParams = lp
+        return card
     }
 
-    private fun primaryButton(label: String, color: Int, isGradient: Boolean = false, onClick: () -> Unit): Button {
-        val bg: GradientDrawable = if (isGradient) {
-            GradientDrawable(
-                GradientDrawable.Orientation.LEFT_RIGHT,
-                intArrayOf(0xFF38BDF8.toInt(), 0xFF4C8DFF.toInt()),
-            ).apply {
-                cornerRadius = dp(14).toFloat()
-            }
-        } else {
-            roundRect(color, dp(14), null).apply {
-                setStroke(dp(1), 0x66FFFFFF)
-            }
-        }
-        return Button(this).apply {
-            text = label
-            textSize = 14f
-            setTextColor(Color.WHITE)
-            isAllCaps = false
-            background = bg
-            setPadding(0, dp(11), 0, dp(11))
-            minimumHeight = 0
-            minHeight = 0
-            stateListAnimator = null
-            setOnClickListener { onClick() }
-        }
-    }
-
-    private fun circle(color: Int): GradientDrawable = GradientDrawable().apply {
-        shape = GradientDrawable.OVAL
-        setColor(color)
-    }
-
-    private fun roundRect(fill: Int, radius: Int, stroke: Int?): GradientDrawable {
-        return GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = radius.toFloat()
+    private fun rounded(fill: Int, radius: Int, stroke: Int, strokeWidth: Int): GradientDrawable =
+        GradientDrawable().apply {
             setColor(fill)
-            if (stroke != null) setStroke(dp(1), stroke)
+            cornerRadius = dp(radius).toFloat()
+            if (strokeWidth > 0) setStroke(dp(strokeWidth), stroke)
         }
+
+    private fun circle(color: Int): GradientDrawable =
+        GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(color)
+        }
+
+    private fun withAlpha(color: Int, alpha: Int): Int =
+        Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
+
+    private fun smallButton(text: String, color: Int): TextView {
+        val tv = TextView(this)
+        tv.text = text
+        tv.setTextColor(color)
+        tv.textSize = 11.5f
+        tv.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        tv.gravity = Gravity.CENTER
+        tv.setPadding(dp(12), dp(6), dp(12), dp(6))
+        tv.background = rounded(colTrace, 10, withAlpha(color, 0x66), 1)
+        return tv
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
-
-    private fun toast(msg: String) {
-        runCatching { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+    private fun actionButton(text: String, fill: Int, textColor: Int): TextView {
+        val tv = TextView(this)
+        tv.text = text
+        tv.setTextColor(textColor)
+        tv.textSize = 13f
+        tv.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        tv.gravity = Gravity.CENTER
+        tv.setPadding(dp(16), dp(11), dp(16), dp(11))
+        val bg = GradientDrawable().apply {
+            setColor(fill)
+            cornerRadius = dp(12).toFloat()
+            setStroke(dp(1), withAlpha(textColor, 0x55))
+        }
+        tv.background = bg
+        return tv
     }
 
-    private companion object {
-        val COL_BG = 0xFF060B14.toInt()
-        val COL_SCRIM = 0xB3000000.toInt()      // 70% 黑遮罩
-        val COL_CARD = 0x4D1E293B.toInt()       // 30% 深蓝卡片
-        val COL_CARD_SOLID = 0xF21E293B.toInt()
-        val COL_CARD2 = 0x661E293B.toInt()
-        val COL_TRACE = 0xB30B1220.toInt()
-        val COL_CARD_WARN = 0xCC2A2418.toInt()
-        val COL_STROKE = 0x33FFFFFF.toInt()
-        val COL_TITLE = 0xFFFFFFFF.toInt()
-        val COL_TEXT = 0xFFFFFFFF.toInt()
-        val COL_SUB = 0xFFE2E8F0.toInt()
-        val COL_DIM = 0xFF94A3B8.toInt()
-        val COL_ACCENT = 0xFF38BDF8.toInt()
-        val COL_OK = 0xFF34D399.toInt()
-        val COL_WARN = 0xFFFBBF24.toInt()
-        val COL_DANGER = 0xFFFF4D6D.toInt()
+    private fun actionButtonGradient(text: String): TextView {
+        val tv = TextView(this)
+        tv.text = text
+        tv.setTextColor(Color.parseColor("#06121F"))
+        tv.textSize = 13f
+        tv.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        tv.gravity = Gravity.CENTER
+        tv.setPadding(dp(16), dp(11), dp(16), dp(11))
+        val bg = GradientDrawable(
+            GradientDrawable.Orientation.LEFT_RIGHT,
+            intArrayOf(Color.parseColor("#38BDF8"), Color.parseColor("#4C8DFF")),
+        )
+        bg.cornerRadius = dp(12).toFloat()
+        tv.background = bg
+        return tv
+    }
+
+    private fun colorForState(state: String): Int = when (state) {
+        "running" -> colAccent
+        "success" -> colOk
+        "failed" -> colDanger
+        "stopped", "stopping" -> colWarn
+        else -> colDim
+    }
+
+    private fun shortState(state: String): String = when (state) {
+        "running" -> "执行中"
+        "success" -> "成功"
+        "failed" -> "失败"
+        "stopped" -> "停止"
+        "stopping" -> "停止中"
+        else -> state
+    }
+
+    private fun humanSize(bytes: Long): String = when {
+        bytes >= 1024L * 1024L -> String.format(Locale.US, "%.1fMB", bytes / 1048576.0)
+        bytes >= 1024L -> String.format(Locale.US, "%.0fKB", bytes / 1024.0)
+        else -> "${bytes}B"
+    }
+
+    companion object {
+        private const val REQ_FILE = 1001
     }
 }
