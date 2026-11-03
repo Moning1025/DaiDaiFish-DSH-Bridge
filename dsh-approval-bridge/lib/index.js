@@ -22,7 +22,13 @@ export function apply(ctx, config) {
 
       // 本地 TCP 模拟通道（测试期用，正式版换 WS + 心跳）
       const client = net.connect(8787, '127.0.0.1', () => {
-        client.write(JSON.stringify({ type: 'approval-request', id: reqId, toolName: req?.toolName }) + '\n');
+        client.write(JSON.stringify({
+          type: 'approval-request',
+          id: reqId,
+          toolName: req?.toolName,
+          reason: req?.reason || req?.displayReason || '',
+          timeoutMs: 15000,
+        }) + '\n');
       });
 
       client.on('data', (data) => {

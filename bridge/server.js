@@ -188,7 +188,8 @@ function startRun(prompt, reply) {
   current = { proc, prompt, startedAt: Date.now() };
 
   log(`[任务] 启动 pid=${proc.pid}: ${prompt.slice(0, 80)}`);
-  reply({ type: 'task-started', data: { prompt, pid: proc.pid } });
+  reply({ type: 'task-started', data: { prompt, pid: proc.pid, cwd: ROOT } });
+  phoneBroadcast({ type: 'task-started', data: { prompt, pid: proc.pid, cwd: ROOT } });
   phoneBroadcast({ type: 'status', phase: 'task_started', data: { prompt } });
 
   // stdout：逐行 JSON → 透传手机
@@ -234,11 +235,19 @@ function startRun(prompt, reply) {
 
 function stopRun(reply) {
   if (!current) return reply({ type: 'error', message: '当前没有在跑的任务' });
+  const pid = current.proc.pid;
   try {
-    current.proc.kill('SIGTERM');
+    if (process.platform === 'win32') {
+      // shell:true 下 proc 只是 cmd.exe 包装，必须 taskkill /T 连孙子进程一起杀
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
+    } else {
+      current.proc.kill('SIGTERM');
+    }
+    log(`[任务] 停止指令已发 pid=${pid}`);
   } catch (err) {
     log(`[任务] kill 失败: ${err.message}`);
   }
+  phoneBroadcast({ type: 'status', phase: 'task_stopping', data: { pid } });
   return reply({ type: 'task-stopping' });
 }
 
@@ -371,7 +380,20 @@ server.on('upgrade', (req, socket) => {
   }
 
   // —— 注册为“在线手机”（fail-closed 判断就靠这个集合）——
-  const phone = { id: peer, send: sendWsJson };
+  // 同一台手机重连时先踢掉旧连接，避免"幽灵在线"把 phones.size 撑到 2~3
+  const peerIp = String(socket.remoteAddress || '');
+  for (const old of Array.from(phones)) {
+    if (old.ip === peerIp) {
+      phones.delete(old);
+      try {
+        old.socket?.destroy();
+      } catch {
+        /* 已断 */
+      }
+      log(`[手机] 踢掉旧连接 ${old.id}（同 IP 重连）`);
+    }
+  }
+  const phone = { id: peer, ip: peerIp, socket, send: sendWsJson };
   phones.add(phone);
   log(`[手机] 已连接 ${peer}（在线 ${phones.size} 部）`);
 

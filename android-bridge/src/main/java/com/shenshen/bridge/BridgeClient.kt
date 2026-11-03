@@ -14,13 +14,14 @@ import kotlin.math.min
 import kotlin.random.Random
 
 /**
- * 与电脑端 bridge/server.js 的长连接客户端。
+ * 与电脑端 bridge/server.js 的长连接客户端（进程内单例）。
  *
  * 职责：
- *  - 连接 ws://<电脑TailscaleIP>:8080（手机走 Tailscale 内网）
+ *  - 连接 ws://<电脑TailscaleIP>:8080
  *  - 断线后指数退避重连（1s → 2s → 4s … 封顶 30s + 随机抖动）
- *  - 收到 approval-request → 写入 BridgeState.pendingApproval 并弹系统通知
- *  - 提供 sendRun / sendApproval 两个上行动作
+ *  - 收到 approval-request → 写 BridgeState + 弹带按钮的通知 + 桌宠气泡 + 音效
+ *  - 收集 thinking / tool_call 事件到「执行轨迹」
+ *  - 提供 sendRun / sendApproval / sendStop / reconnect
  */
 class BridgeClient(
     private val serverUrl: String = Config.DEFAULT_SERVER_URL,
@@ -32,6 +33,15 @@ class BridgeClient(
         private const val BASE_BACKOFF_MS = 1_000L
         private const val MAX_BACKOFF_MS = 30_000L
         private const val PING_INTERVAL_SEC = 30L
+
+        /** 全进程唯一实例（BridgeService 创建，UI / 通知按钮共用） */
+        @Volatile
+        var shared: BridgeClient? = null
+            private set
+
+        fun install(client: BridgeClient) {
+            shared = client
+        }
     }
 
     private val http = OkHttpClient.Builder()
@@ -62,25 +72,44 @@ class BridgeClient(
     fun stop() {
         stopped.set(true)
         reconnectPending.set(false)
-        socket?.close(1000, "client stop")
-        socket = null
+        closeSocket("client stop")
         BridgeState.setStatus(BridgeState.Status.DISCONNECTED)
     }
 
-    /** 下发一次任务给电脑端 dsh。 */
-    fun sendRun(prompt: String): Boolean = sendJson { root ->
-        root.put("action", "run")
-        root.put("prompt", prompt)
+    /** 【重连】按钮：立刻掐掉旧连接并重连（不等退避） */
+    fun reconnect() {
+        Log.i(TAG, "manual reconnect")
+        stopped.set(false)
+        attempt = 0
+        reconnectPending.set(false)
+        closeSocket("manual reconnect")
+        BridgeState.setStatus(BridgeState.Status.CONNECTING)
+        connectNow()
     }
 
-    /** 审批回包：outcome ∈ allowed-once / rejected。 */
+    /** 下发一次任务给电脑端 dsh。 */
+    fun sendRun(prompt: String): Boolean {
+        BridgeState.clearTrace()
+        return sendJson { root ->
+            root.put("action", "run")
+            root.put("prompt", prompt)
+        }
+    }
+
+    /** 停止当前任务 */
+    fun sendStop(): Boolean = sendJson { root -> root.put("action", "stop") }
+
+    /** 审批回包：outcome ∈ allowed-once / rejected */
     fun sendApproval(callId: String, outcome: String): Boolean {
         val ok = sendJson { root ->
             root.put("action", "approval")
             root.put("id", callId)
             root.put("decision", outcome)
         }
-        if (ok) BridgeState.clearPendingApproval()
+        if (ok) {
+            BridgeState.clearPendingApproval()
+            cancelApprovalNotification()
+        }
         return ok
     }
 
@@ -99,8 +128,16 @@ class BridgeClient(
         }
     }
 
+    private fun closeSocket(reason: String) {
+        val old = socket
+        socket = null
+        runCatching { old?.close(1000, reason) }
+        runCatching { old?.cancel() }   // 双保险：close 对已半死的连接不管用
+    }
+
     private fun connectNow() {
         if (stopped.get()) return
+        closeSocket("reconnect")     // 先掐掉可能残留的旧连接，避免服务端看到"幽灵在线"
         BridgeState.setStatus(
             if (attempt == 0) BridgeState.Status.CONNECTING else BridgeState.Status.RECONNECTING,
         )
@@ -134,6 +171,8 @@ class BridgeClient(
         }
     }
 
+    // ------------------------------------------------------------ 消息分发
+
     private fun dispatch(text: String) {
         val obj = try {
             JSONObject(text)
@@ -142,38 +181,117 @@ class BridgeClient(
             return
         }
         when (obj.optString("type")) {
-            "approval-request" -> {
-                val data = obj.optJSONObject("data") ?: obj
-                val id = data.optString("id").ifEmpty { data.optString("callId") }
-                val pending = BridgeState.PendingApproval(
-                    id = id,
-                    toolName = data.optString("toolName"),
-                    reason = data.optString("reason"),
-                    receivedAt = System.currentTimeMillis(),
-                )
-                BridgeState.setPendingApproval(pending)
-                notifyApprovalAsync(pending)
+            "approval-request" -> handleApprovalRequest(obj)
+            "approval-resolved" -> {
+                BridgeState.clearPendingApproval()
+                cancelApprovalNotification()
             }
-            "approval-resolved" -> BridgeState.clearPendingApproval()
+            "event" -> handleEvent(obj.optJSONObject("data") ?: obj)
+            "task-started" -> {
+                BridgeState.setTaskRunning(true)
+                val data = obj.optJSONObject("data")
+                data?.optString("cwd")?.let { BridgeState.setCwd(it) }
+            }
+            "task-done" -> {
+                BridgeState.setTaskRunning(false)
+                BridgeState.clearPendingApproval()
+                cancelApprovalNotification()
+            }
+            "session" -> {
+                val data = obj.optJSONObject("data") ?: obj
+                (data.optString("cwd").ifEmpty { null })?.let { BridgeState.setCwd(it) }
+            }
+            "error" -> {
+                val data = obj.optJSONObject("data")
+                val msg = data?.optString("message") ?: obj.optString("message")
+                if (msg.isNotEmpty()) BridgeState.setStatus(BridgeState.status, msg)
+            }
             else -> Unit
         }
         onEvent?.invoke(obj)
     }
 
-    private fun notifyApprovalAsync(pending: BridgeState.PendingApproval) {
-        // 通知需要 Context；由 BridgeService 注入（见 setNotifierContext），这里只做兜底日志。
+    private fun handleApprovalRequest(obj: JSONObject) {
+        val data = obj.optJSONObject("data") ?: obj
+        val id = data.optString("id").ifEmpty { data.optString("callId") }
+        val toolName = data.optString("toolName")
+        val reason = data.optString("reason")
+        val timeout = data.optLong("timeoutMs", Config.APPROVAL_TIMEOUT_MS)
+        val pending = BridgeState.PendingApproval(
+            id = id,
+            toolName = toolName,
+            reason = reason,
+            receivedAt = System.currentTimeMillis(),
+            timeoutMs = timeout,
+        )
+        BridgeState.setPendingApproval(pending)
+
         val ctx = notifierContext
-        if (ctx == null) {
-            Log.w(TAG, "no context for notification, pending id=${pending.id}")
-            return
+        if (ctx != null) {
+            runCatching { ApprovalNotifier.notifyApproval(ctx, pending) }
+                .onFailure { Log.w(TAG, "notify failed", it) }
         }
-        runCatching { ApprovalNotifier.notifyApproval(ctx, pending) }
-            .onFailure { Log.w(TAG, "notify failed", it) }
+
+        // 桌宠气泡：DSH审批：pwsh | 需要在工作区外写入 test.txt
+        val brief = buildString {
+            append("DSH审批：")
+            append(toolName.ifBlank { "工具" })
+            val r = reason.replace('\n', ' ').trim()
+            if (r.isNotEmpty()) {
+                append(" | ")
+                append(if (r.length > 40) r.take(40) + "…" else r)
+            }
+        }
+        BridgeHooks.showBubble(brief)
+        BridgeHooks.playClick()
+    }
+
+    private fun handleEvent(data: JSONObject) {
+        val kind = data.optString("type").ifEmpty { data.optString("event") }
+        when (kind) {
+            "thinking" -> {
+                val text = firstNonEmpty(data, "delta", "text", "content", "message")
+                if (text.isNotBlank()) {
+                    BridgeState.addTrace(
+                        BridgeState.TraceEntry(
+                            kind = "thinking",
+                            brief = "思考：" + text.replace('\n', ' ').take(60),
+                            detail = text,
+                            at = System.currentTimeMillis(),
+                        ),
+                    )
+                }
+            }
+            "tool_call" -> {
+                val tool = firstNonEmpty(data, "tool", "name", "toolName").ifBlank { "工具" }
+                val args = firstNonEmpty(data, "arguments", "args", "input", "argumentsText")
+                BridgeState.addTrace(
+                    BridgeState.TraceEntry(
+                        kind = "tool_call",
+                        brief = "调用 $tool" + if (args.isNotBlank()) "：" + args.replace('\n', ' ').take(50) else "",
+                        detail = "$tool\n$args",
+                        at = System.currentTimeMillis(),
+                    ),
+                )
+            }
+            else -> Unit
+        }
+    }
+
+    private fun firstNonEmpty(obj: JSONObject, vararg keys: String): String {
+        for (k in keys) {
+            val v = obj.opt(k) ?: continue
+            val s = when (v) {
+                is String -> v
+                else -> v.toString()
+            }
+            if (s.isNotBlank() && s != "null") return s
+        }
+        return ""
     }
 
     private fun scheduleReconnect() {
         if (stopped.get()) return
-        if (socket != null) socket = null
         if (!reconnectPending.compareAndSet(false, true)) return
         attempt++
         val shift = min(attempt - 1, 5)
@@ -184,6 +302,11 @@ class BridgeClient(
             reconnectPending.set(false)
             connectNow()
         }, delay, TimeUnit.MILLISECONDS)
+    }
+
+    private fun cancelApprovalNotification() {
+        val ctx = notifierContext ?: return
+        runCatching { ApprovalNotifier.cancelApproval(ctx) }
     }
 
     /** 由 BridgeService 在启动时注入，避免通知依赖 UI 层。 */

@@ -1,13 +1,15 @@
 package com.shenshen.bridge
 
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
 
 /**
- * 前台服务：拉起并持有 [BridgeClient]，保证锁屏/后台不被杀。
- * 常驻通知 + START_STICKY 保活。
+ * 前台服务：拉起并持有 [BridgeClient] 单例，保证锁屏/后台不被杀。
+ * 常驻通知（点它进 DSH 控制台）+ START_STICKY 保活。
  */
 class BridgeService : Service() {
 
@@ -17,14 +19,25 @@ class BridgeService : Service() {
         @Volatile
         var isRunning: Boolean = false
             private set
-    }
 
-    private var client: BridgeClient? = null
+        /** UI / 通知按钮都可以用它确保服务在跑 */
+        fun start(context: Context) {
+            runCatching {
+                val intent = Intent(context, BridgeService::class.java)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            }.onFailure { Log.w(TAG, "start service failed", it) }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         isRunning = true
         ApprovalNotifier.ensureChannels(this)
+        BridgeHooks.attachContext(this)
         startForeground(
             ApprovalNotifier.serviceNotificationId(),
             ApprovalNotifier.buildServiceNotification(this, connected = false),
@@ -33,14 +46,14 @@ class BridgeService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (client == null) {
+        if (BridgeClient.shared == null) {
             val bridge = BridgeClient()
             bridge.notifierContext = applicationContext
             BridgeState.addListener { status, _ ->
                 updateNotification(status == BridgeState.Status.CONNECTED)
             }
+            BridgeClient.install(bridge)
             bridge.start()
-            client = bridge
             Log.i(TAG, "bridge client started")
         }
         return START_STICKY
@@ -48,8 +61,7 @@ class BridgeService : Service() {
 
     override fun onDestroy() {
         Log.i(TAG, "service destroyed")
-        client?.stop()
-        client = null
+        BridgeClient.shared?.stop()
         isRunning = false
         super.onDestroy()
     }

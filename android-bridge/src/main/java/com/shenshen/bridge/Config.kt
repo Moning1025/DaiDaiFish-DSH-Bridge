@@ -10,9 +10,23 @@ package com.shenshen.bridge
  */
 object Config {
 
-    /** 电脑端 bridge/server.json 的 WebSocket 端口（Tailscale 内网 IP）。 */
+    /** 电脑端 bridge/server.js 的 WebSocket 端口（Tailscale 内网 IP）。 */
     const val DEFAULT_SERVER_URL = "ws://100.93.161.33:8080"
 
     /** 审批超时（毫秒），与电脑端 server.js 的 APPROVAL_TIMEOUT_MS 对齐。 */
     const val APPROVAL_TIMEOUT_MS = 15_000L
+
+    /** 通知栏审批按钮 → 广播动作 */
+    const val ACTION_APPROVAL = "com.shenshen.bridge.ACTION_APPROVAL"
+    const val EXTRA_ID = "extra_id"
+    const val EXTRA_DECISION = "extra_decision"
+
+    const val DECISION_ALLOW_ONCE = "allowed-once"
+    const val DECISION_REJECT = "rejected"
+
+    const val NOTIFY_ID_APPROVAL = 1001
+    const val NOTIFY_ID_SERVICE = 1000
+
+    /** 执行轨迹最多保留条数 */
+    const val TRACE_MAX = 60
 }
