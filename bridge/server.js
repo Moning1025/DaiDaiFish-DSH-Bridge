@@ -180,7 +180,11 @@ function startRun(prompt, reply) {
   }
 
   const childEnv = { ...process.env, DEEPSEEK_API_KEY: apiKey, DEEPSEEK_BASE_URL: baseUrl };
-  const proc = spawn('dsh', ['--profile', 'headless', '--json', prompt], {
+  // shell:true 时 Node 只是把 argv 用空格拼起来，prompt 里带空格/连字符会被 dsh 当成自己的参数
+  // （例如 "ping 127.0.0.1 -n 5" 会报 unknown option '-n'）→ 自己拼一条命令串并给 prompt 加引号
+  const quotedPrompt = '"' + String(prompt).replace(/"/g, '\\"') + '"';
+  const cmdLine = `dsh --profile headless --json ${quotedPrompt}`;
+  const proc = spawn(cmdLine, {
     cwd: ROOT,
     env: childEnv,
     shell: true,
@@ -189,7 +193,6 @@ function startRun(prompt, reply) {
 
   log(`[任务] 启动 pid=${proc.pid}: ${prompt.slice(0, 80)}`);
   reply({ type: 'task-started', data: { prompt, pid: proc.pid, cwd: ROOT } });
-  phoneBroadcast({ type: 'task-started', data: { prompt, pid: proc.pid, cwd: ROOT } });
   phoneBroadcast({ type: 'status', phase: 'task_started', data: { prompt } });
 
   // stdout：逐行 JSON → 透传手机
