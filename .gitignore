@@ -13,6 +13,10 @@ dist/
 # 逆向中间产物
 _tmp/
 apktool.yml
+# apktool 解包目录（~72MB，改 smali 用，不入库）
+decompiled/
+# 用户临时投放目录（背景图已归位到 android-bridge/assets/）
+android-bridge/新建文件夹/
 
 # IDE
 .idea/

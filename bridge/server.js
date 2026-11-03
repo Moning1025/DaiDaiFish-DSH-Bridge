@@ -45,6 +45,9 @@ const APPROVAL_PORT = Number(process.env.APPROVAL_PORT || 8787); // 插件 TCP �
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const DEFAULT_BASE_URL = 'https://www.tokenav.ai/v1';
 const APPROVAL_TIMEOUT_MS = Number(process.env.APPROVAL_TIMEOUT_MS || 15000); // 与插件侧 15s 对齐
+const WORKSPACE_FILE =
+  process.env.DSH_WORKSPACE_FILE ||
+  'D:\\DeepSeekHarness\\dsh_data\\storages\\workspace.json'; // DSH 工作区注册表
 
 // ---- .env 读取（KEY 只从环境或 .env 来，绝不硬编码） ----
 function loadDotenv() {
@@ -71,6 +74,97 @@ const baseUrl = process.env.DEEPSEEK_BASE_URL || dotenv.DSH_TEST_BASE_URL || DEF
 
 function log(msg) {
   console.log(`[${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${msg}`);
+}
+
+// ============================================================
+// 〇·五、工作区注册表（读写 DSH 的 workspace.json，给手机端选 cwd）
+// ============================================================
+function readRegistry() {
+  try {
+    if (!fs.existsSync(WORKSPACE_FILE)) return null;
+    return JSON.parse(fs.readFileSync(WORKSPACE_FILE, 'utf8'));
+  } catch (err) {
+    log(`[工作区] 读取注册表失败: ${err.message}`);
+    return null;
+  }
+}
+
+function writeRegistry(reg) {
+  const tmp = `${WORKSPACE_FILE}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(reg, null, 2), 'utf8');
+  fs.renameSync(tmp, WORKSPACE_FILE);
+}
+
+function listWorkspaces() {
+  const reg = readRegistry();
+  const table = (reg && reg.tables && reg.tables.workspaces) || {};
+  const ids = (reg && reg.global && reg.global.workspaceIds) || Object.keys(table);
+  const out = [];
+  for (const id of ids) {
+    const ws = table[id];
+    if (!ws || !ws.path) continue;
+    out.push({
+      id,
+      title: ws.title || path.basename(ws.path) || ws.path,
+      path: ws.path,
+      updatedAt: ws.updatedAt || ws.createdAt || '',
+      exists: fs.existsSync(ws.path),
+    });
+  }
+  out.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  return out;
+}
+
+function createWorkspace(rawPath) {
+  const input = String(rawPath || '')
+    .trim()
+    .replace(/^"(.*)"$/, '$1');
+  if (!input) throw new Error('工作区路径不能为空');
+  if (!path.isAbsolute(input)) throw new Error('必须是绝对路径，例如 D:\\DeepSeekHarness\\my-project');
+  const dir = path.resolve(input);
+
+  const reg = readRegistry();
+  if (!reg || !reg.tables || !reg.tables.workspaces) {
+    throw new Error(`注册表不可用：${WORKSPACE_FILE}`);
+  }
+  reg.global = reg.global || {};
+  reg.global.workspaceIds = reg.global.workspaceIds || [];
+
+  for (const [id, ws] of Object.entries(reg.tables.workspaces)) {
+    if (ws && ws.path && path.resolve(ws.path).toLowerCase() === dir.toLowerCase()) {
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      return { id, title: ws.title || path.basename(dir), path: ws.path, existed: true };
+    }
+  }
+
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.statSync(dir).isDirectory()) throw new Error('目标路径不是文件夹');
+
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  reg.tables.workspaces[id] = {
+    path: dir,
+    title: path.basename(dir) || dir,
+    sessionIds: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+  reg.global.workspaceIds.push(id);
+  writeRegistry(reg);
+  log(`[工作区] 已创建 ${id} → ${dir}`);
+  return { id, title: path.basename(dir) || dir, path: dir, existed: false };
+}
+
+function resolveCwd(workspace) {
+  const want = String(workspace || '').trim();
+  if (!want) return ROOT;
+  try {
+    const dir = path.resolve(want);
+    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return dir;
+  } catch {
+    /* 路径非法 */
+  }
+  return null;
 }
 
 // ============================================================
@@ -171,12 +265,17 @@ const approvalServer = net.createServer((socket) => {
 // ============================================================
 // 三、任务执行（spawn dsh headless --json，事件流实时推手机）
 // ============================================================
-function startRun(prompt, reply) {
+function startRun(prompt, reply, workspace) {
   if (current) {
     return reply({ type: 'error', message: '已有任务在跑，先发 stop 或等它结束' });
   }
   if (!apiKey) {
     return reply({ type: 'error', message: '缺少 DEEPSEEK_API_KEY（请写入项目根 .env）' });
+  }
+
+  const cwd = resolveCwd(workspace);
+  if (!cwd) {
+    return reply({ type: 'error', message: `工作区不可用（路径不存在）：${workspace}` });
   }
 
   const childEnv = { ...process.env, DEEPSEEK_API_KEY: apiKey, DEEPSEEK_BASE_URL: baseUrl };
@@ -185,15 +284,15 @@ function startRun(prompt, reply) {
   const quotedPrompt = '"' + String(prompt).replace(/"/g, '\\"') + '"';
   const cmdLine = `dsh --profile headless --json ${quotedPrompt}`;
   const proc = spawn(cmdLine, {
-    cwd: ROOT,
+    cwd,
     env: childEnv,
     shell: true,
   });
-  current = { proc, prompt, startedAt: Date.now() };
+  current = { proc, prompt, cwd, startedAt: Date.now() };
 
-  log(`[任务] 启动 pid=${proc.pid}: ${prompt.slice(0, 80)}`);
-  reply({ type: 'task-started', data: { prompt, pid: proc.pid, cwd: ROOT } });
-  phoneBroadcast({ type: 'status', phase: 'task_started', data: { prompt } });
+  log(`[任务] 启动 pid=${proc.pid} cwd=${cwd}: ${prompt.slice(0, 80)}`);
+  reply({ type: 'task-started', data: { prompt, pid: proc.pid, cwd } });
+  phoneBroadcast({ type: 'status', phase: 'task_started', data: { prompt, cwd } });
 
   // stdout：逐行 JSON → 透传手机
   let buffer = '';
@@ -291,6 +390,33 @@ const server = http.createServer((req, res) => {
       pendingApprovals: pending.size,
       taskRunning: Boolean(current),
     });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/workspaces') {
+    return sendHttpJson(res, 200, { ok: true, workspaces: listWorkspaces() });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/workspaces/create') {
+    let raw = '';
+    req.on('data', (c) => {
+      raw += c;
+      if (raw.length > 1e6) req.destroy();
+    });
+    req.on('end', () => {
+      let input = {};
+      try {
+        input = JSON.parse(raw || '{}');
+      } catch {
+        return sendHttpJson(res, 400, { ok: false, error: '无效 JSON' });
+      }
+      try {
+        const ws = createWorkspace(input.path);
+        return sendHttpJson(res, 200, { ok: true, workspace: ws });
+      } catch (err) {
+        return sendHttpJson(res, 400, { ok: false, error: err.message });
+      }
+    });
+    return null;
   }
 
   return sendHttpJson(res, 404, { error: 'not_found' });
@@ -413,7 +539,19 @@ server.on('upgrade', (req, socket) => {
         if (!msg.prompt || !String(msg.prompt).trim()) {
           return sendWsJson({ type: 'error', message: 'prompt 不能为空' });
         }
-        return startRun(String(msg.prompt).trim(), sendWsJson);
+        return startRun(String(msg.prompt).trim(), sendWsJson, msg.workspace);
+
+      case 'workspaces':
+        return sendWsJson({ type: 'workspaces', data: listWorkspaces() });
+
+      case 'create-workspace':
+        try {
+          const ws = createWorkspace(msg.path);
+          sendWsJson({ type: 'workspace-created', data: ws });
+          return sendWsJson({ type: 'workspaces', data: listWorkspaces() });
+        } catch (err) {
+          return sendWsJson({ type: 'error', message: err.message });
+        }
 
       case 'stop':
         return stopRun(sendWsJson);

@@ -87,13 +87,24 @@ class BridgeClient(
         connectNow()
     }
 
-    /** 下发一次任务给电脑端 dsh。 */
-    fun sendRun(prompt: String): Boolean {
+    /** 下发一次任务给电脑端 dsh。workspace = 目标工作区绝对路径（空则用服务端默认根目录） */
+    fun sendRun(prompt: String, workspace: String? = null): Boolean {
         BridgeState.clearTrace()
         return sendJson { root ->
             root.put("action", "run")
             root.put("prompt", prompt)
+            val ws = workspace ?: BridgeState.selectedWorkspace
+            if (!ws.isNullOrBlank()) root.put("workspace", ws)
         }
+    }
+
+    /** 拉取电脑端工作区列表 */
+    fun requestWorkspaces(): Boolean = sendJson { root -> root.put("action", "workspaces") }
+
+    /** 在电脑端新建工作区（创建目录并写入 workspace.json 注册表） */
+    fun createWorkspace(path: String): Boolean = sendJson { root ->
+        root.put("action", "create-workspace")
+        root.put("path", path)
     }
 
     /** 停止当前任务 */
@@ -152,6 +163,7 @@ class BridgeClient(
             reconnectPending.set(false)
             BridgeState.setStatus(BridgeState.Status.CONNECTED)
             Log.i(TAG, "connected: $serverUrl")
+            requestWorkspaces()   // 连上就顺手拉一次工作区列表
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -200,6 +212,31 @@ class BridgeClient(
             "session" -> {
                 val data = obj.optJSONObject("data") ?: obj
                 (data.optString("cwd").ifEmpty { null })?.let { BridgeState.setCwd(it) }
+            }
+            "workspaces" -> {
+                val arr = obj.optJSONArray("data")
+                val list = ArrayList<BridgeState.WorkspaceInfo>()
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val p = o.optString("path")
+                        if (p.isEmpty()) continue
+                        list.add(
+                            BridgeState.WorkspaceInfo(
+                                id = o.optString("id"),
+                                title = o.optString("title").ifEmpty { p },
+                                path = p,
+                                exists = o.optBoolean("exists", true),
+                            ),
+                        )
+                    }
+                }
+                BridgeState.setWorkspaces(list)
+            }
+            "workspace-created" -> {
+                val data = obj.optJSONObject("data")
+                val p = data?.optString("path")
+                if (!p.isNullOrEmpty()) BridgeState.selectWorkspace(p)
             }
             "error" -> {
                 val data = obj.optJSONObject("data")

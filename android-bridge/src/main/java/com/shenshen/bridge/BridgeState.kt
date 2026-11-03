@@ -26,6 +26,14 @@ object BridgeState {
         val at: Long,
     )
 
+    /** 电脑端 DSH 的一个工作区（来自 workspace.json 注册表） */
+    data class WorkspaceInfo(
+        val id: String,
+        val title: String,
+        val path: String,
+        val exists: Boolean = true,
+    )
+
     /** 老接口：只关心连接状态与待审批（BridgeService 用来刷新常驻通知） */
     fun interface Listener {
         fun onChanged(status: Status, pending: PendingApproval?)
@@ -54,6 +62,16 @@ object BridgeState {
 
     @Volatile
     var taskRunning: Boolean = false
+        private set
+
+    /** 电脑端工作区列表（null 表示还没拉过） */
+    @Volatile
+    var workspaces: List<WorkspaceInfo>? = null
+        private set
+
+    /** 手机上选中的工作区路径（发任务时随 run 一起发；空 = 用服务端默认根目录） */
+    @Volatile
+    var selectedWorkspace: String? = null
         private set
 
     private val traceEntries = ArrayList<TraceEntry>()
@@ -100,6 +118,22 @@ object BridgeState {
     @Synchronized
     fun setTaskRunning(running: Boolean) {
         taskRunning = running
+        notifyRefresh()
+    }
+
+    @Synchronized
+    fun setWorkspaces(list: List<WorkspaceInfo>) {
+        workspaces = list
+        if (selectedWorkspace == null) {
+            selectedWorkspace = list.firstOrNull { it.title.contains("DaiDaiFish", ignoreCase = true) }?.path
+                ?: list.firstOrNull()?.path
+        }
+        notifyRefresh()
+    }
+
+    @Synchronized
+    fun selectWorkspace(path: String?) {
+        selectedWorkspace = path
         notifyRefresh()
     }
 
