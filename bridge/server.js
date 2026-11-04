@@ -707,7 +707,21 @@ function startTask({ prompt, workspace, sessionId, newTask, attachments }, reply
   const cmdLine = resumeId
     ? `dsh --profile headless --session-id ${resumeId} --json ${quotedPrompt}`
     : `dsh --profile headless --json ${quotedPrompt}`;
-  const proc = spawn(cmdLine, { cwd, env: childEnv, shell: true });
+  let proc;
+  try {
+    proc = spawn(cmdLine, { cwd, env: childEnv, shell: true });
+  } catch (err) {
+    // spawn 被策略拒绝（EPERM/EACCES/ENOENT）时绝不能把整个服务进程带崩
+    const msg = `启动 dsh 子进程失败：${err && err.message ? err.message : String(err)}`;
+    log(`[任务] ${task.taskId} ${msg}`);
+    task.state = 'failed';
+    task.errorMessage = msg;
+    tasks.set(task.taskId, task);
+    lastTaskId = task.taskId;
+    reply({ type: 'error', code: 'SPAWN_FAILED', message: msg, data: { taskId: task.taskId } });
+    broadcastTasks();
+    return;
+  }
   task.proc = proc;
   task.pid = proc.pid;
   tasks.set(task.taskId, task);
@@ -1126,6 +1140,14 @@ server.on('upgrade', (req, socket) => {
 // ============================================================
 // 七、启动
 // ============================================================
+// 兜底：任何漏网异常都不许把中转服务带崩（崩溃＝手机立即断连，必须人工重启）
+process.on('uncaughtException', (err) => {
+  log(`[致命] 未捕获异常（已拦截，服务继续运行）: ${err && err.stack ? err.stack.split('\n').slice(0, 4).join(' | ') : String(err)}`);
+});
+process.on('unhandledRejection', (reason) => {
+  log(`[警告] 未处理的 Promise 拒绝（已拦截）: ${reason && reason.message ? reason.message : String(reason)}`);
+});
+
 server.listen(PORT, '0.0.0.0', () => {
   log(`DSH 中转服务已启动: http://0.0.0.0:${PORT}  (WebSocket 同端口，接受外部请求)`);
 });
